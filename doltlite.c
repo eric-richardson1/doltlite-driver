@@ -175,7 +175,7 @@
 # define DOLTLITE_PROLLY 1
 #endif
 #ifndef DOLTLITE_VERSION
-# define DOLTLITE_VERSION "0.51.2"
+# define DOLTLITE_VERSION "0.51.2-dolthub"
 #endif
 #ifndef DOLTLITE_ENABLE_REMOTES
 # define DOLTLITE_ENABLE_REMOTES 1
@@ -11763,9 +11763,10 @@ SQLITE_API int SQLITE_APICALL doltlite_set_chunk_source(
 ** immediately loads the new branch state through it; otherwise graph loading
 ** is deferred until a source is registered or the graph is first accessed.
 **
-** The refs blob may include the origin remote and tracking refs. DoltLite
-** copies the blob before this function returns. The database must be writable
-** and outside a transaction. The refs update is durable before any immediate
+** The refs blob may include the origin remote and tracking refs. Remotes
+** already configured on the database and not named by the blob are kept.
+** DoltLite copies the blob before this function returns. The database must
+** be writable and outside a transaction. The refs update is durable before any immediate
 ** source-backed hydration; if that hydration fails, the installed refs remain
 ** available for a later retry.
 */
@@ -23009,6 +23010,7 @@ SQLITE_PRIVATE void sqlite3ErrorClear(sqlite3*);
 SQLITE_PRIVATE void sqlite3SystemError(sqlite3*,int);
 #ifdef DOLTLITE_PROLLY
 char *doltliteTakeChunkSourceError(sqlite3*,int*);
+char *doltliteTakeMissingChunkError(sqlite3*,int);
 int doltliteChunkSourceActive(sqlite3*);
 int doltliteOwnSchemaReload(sqlite3*);
 int doltliteInCommandTxn(sqlite3*);
@@ -23341,6 +23343,9 @@ SQLITE_PRIVATE int sqlite3VtabEponymousTableInit(Parse*,Module*);
 SQLITE_PRIVATE void sqlite3VtabEponymousTableClear(sqlite3*,Module*);
 SQLITE_PRIVATE void sqlite3VtabMakeWritable(Parse*,Table*);
 #ifdef DOLTLITE_PROLLY
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+SQLITE_PRIVATE void sqlite3VtabEponymousSchemaClear(sqlite3*, Schema*);
+#endif
 SQLITE_PRIVATE void sqlite3BtreeMarkMasterRootChanged(Btree*);
 int doltliteBtreeCaptureStatement(void*);
 void doltliteWorkspaceFinishStatement(Vdbe*);
@@ -24508,6 +24513,10 @@ struct ChunkStore {
   int checkpointActive;
   sqlite3_vfs *pOwnedVfs;
   DoltliteChunkSourceState *pChunkSource;
+  /* Last chunk a read found absent with no source to fetch it from. Probes
+  ** expect the miss, so it only explains an otherwise generic failure. */
+  u8 bMissingChunk;
+  ProllyHash missingChunk;
 
 };
 
@@ -24627,6 +24636,11 @@ int chunkStoreHas(ChunkStore *cs, const ProllyHash *hash, int *pHas);
 
 int chunkStoreGet(ChunkStore *cs, const ProllyHash *hash,
                   u8 **ppData, int *pnData);
+/* Accepts at most CHUNK_READ_BATCH_MAX hashes and returns a bounded prefix.
+** Missing chunks are NULL; callers free all non-NULL outputs. On error,
+** all outputs and *pnRead are cleared. */
+int chunkStoreReadBatch(ChunkStore *cs, const ProllyHash *aHash, int nHash,
+                        u8 **apData, int *anData, int *pnRead);
 /* A committed chunk of an in-memory store, without a copy. *ppData stays
 ** valid, followed by CHUNK_STORE_BORROW_PAD zero bytes, until *ppSeg is
 ** passed to chunkStoreBorrowRelease(). SQLITE_NOTFOUND when the chunk is not
@@ -24635,8 +24649,9 @@ int chunkStoreGet(ChunkStore *cs, const ProllyHash *hash,
 int chunkStoreBorrow(ChunkStore *cs, const ProllyHash *hash,
                      const u8 **ppData, int *pnData, void **ppSeg);
 void chunkStoreBorrowRelease(void *pSeg);
+#define CHUNK_READ_BATCH_MAX 256
+#define CHUNK_READ_BATCH_BYTES (64*1024)
 #define CHUNK_READ_AHEAD_MAX 16
-#define CHUNK_READ_AHEAD_BYTES (64*1024)
 int chunkStoreReadAhead(ChunkStore *cs, const ProllyHash *aHash, int nHash,
     int (*xCached)(void*, const ProllyHash*),
     int (*xRead)(void*, const ProllyHash*, const u8*, int), void *pCtx);
@@ -24654,11 +24669,14 @@ int chunkStoreSourceSet(ChunkStore *cs, sqlite3 *db,
 void chunkStoreSourceCloseWriter(ChunkStore *cs);
 void chunkStoreSourceClose(ChunkStore *cs);
 char *chunkStoreSourceTakeError(ChunkStore *cs, int *pRc);
+char *chunkStoreTakeMissingChunkError(ChunkStore *cs);
 int chunkStoreOriginSourceEnabled(ChunkStore *cs);
 int chunkStoreSourceEnabled(ChunkStore *cs);
 
 int chunkStorePut(ChunkStore *cs, const u8 *pData, int nData,
                   ProllyHash *pHash);
+int chunkStorePutChecked(ChunkStore *cs, const ProllyHash *pExpected,
+                         const u8 *pData, int nData);
 /* True when the staged write buffer has reached the drain threshold. */
 int chunkStoreStagingExceedsDrain(ChunkStore *cs);
 int chunkStorePutSparse(ChunkStore *cs, const u8 *pPrefix, int nPrefix,
@@ -57479,6 +57497,9 @@ SQLITE_API int sqlite3_deserialize(
       rc = SQLITE_NOMEM;
       goto end_deserialize;
     }
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+    sqlite3VtabEponymousSchemaClear(db, db->aDb[iDb].pSchema);
+#endif
     sqlite3BtreeClose(db->aDb[iDb].pBt);
     db->aDb[iDb].pBt = pNewBt;
     db->aDb[iDb].pSchema = pNewSchema;
@@ -89038,6 +89059,10 @@ struct ChunkStore {
   int checkpointActive;
   sqlite3_vfs *pOwnedVfs;
   DoltliteChunkSourceState *pChunkSource;
+  /* Last chunk a read found absent with no source to fetch it from. Probes
+  ** expect the miss, so it only explains an otherwise generic failure. */
+  u8 bMissingChunk;
+  ProllyHash missingChunk;
 
 };
 
@@ -89157,6 +89182,11 @@ int chunkStoreHas(ChunkStore *cs, const ProllyHash *hash, int *pHas);
 
 int chunkStoreGet(ChunkStore *cs, const ProllyHash *hash,
                   u8 **ppData, int *pnData);
+/* Accepts at most CHUNK_READ_BATCH_MAX hashes and returns a bounded prefix.
+** Missing chunks are NULL; callers free all non-NULL outputs. On error,
+** all outputs and *pnRead are cleared. */
+int chunkStoreReadBatch(ChunkStore *cs, const ProllyHash *aHash, int nHash,
+                        u8 **apData, int *anData, int *pnRead);
 /* A committed chunk of an in-memory store, without a copy. *ppData stays
 ** valid, followed by CHUNK_STORE_BORROW_PAD zero bytes, until *ppSeg is
 ** passed to chunkStoreBorrowRelease(). SQLITE_NOTFOUND when the chunk is not
@@ -89165,8 +89195,9 @@ int chunkStoreGet(ChunkStore *cs, const ProllyHash *hash,
 int chunkStoreBorrow(ChunkStore *cs, const ProllyHash *hash,
                      const u8 **ppData, int *pnData, void **ppSeg);
 void chunkStoreBorrowRelease(void *pSeg);
+#define CHUNK_READ_BATCH_MAX 256
+#define CHUNK_READ_BATCH_BYTES (64*1024)
 #define CHUNK_READ_AHEAD_MAX 16
-#define CHUNK_READ_AHEAD_BYTES (64*1024)
 int chunkStoreReadAhead(ChunkStore *cs, const ProllyHash *aHash, int nHash,
     int (*xCached)(void*, const ProllyHash*),
     int (*xRead)(void*, const ProllyHash*, const u8*, int), void *pCtx);
@@ -89184,11 +89215,14 @@ int chunkStoreSourceSet(ChunkStore *cs, sqlite3 *db,
 void chunkStoreSourceCloseWriter(ChunkStore *cs);
 void chunkStoreSourceClose(ChunkStore *cs);
 char *chunkStoreSourceTakeError(ChunkStore *cs, int *pRc);
+char *chunkStoreTakeMissingChunkError(ChunkStore *cs);
 int chunkStoreOriginSourceEnabled(ChunkStore *cs);
 int chunkStoreSourceEnabled(ChunkStore *cs);
 
 int chunkStorePut(ChunkStore *cs, const u8 *pData, int nData,
                   ProllyHash *pHash);
+int chunkStorePutChecked(ChunkStore *cs, const ProllyHash *pExpected,
+                         const u8 *pData, int nData);
 /* True when the staged write buffer has reached the drain threshold. */
 int chunkStoreStagingExceedsDrain(ChunkStore *cs);
 int chunkStorePutSparse(ChunkStore *cs, const u8 *pPrefix, int nPrefix,
@@ -111612,6 +111646,14 @@ abort_due_to_error:
    && !doltliteChunkSourceActive(db) ){
     rc = SQLITE_CORRUPT_BKPT;
   }
+  if( db->pParse==0 ){
+    char *zMiss = doltliteTakeMissingChunkError(
+        db, p->zErrMsg==0 ? rc : SQLITE_OK);
+    if( zMiss ){
+      sqlite3VdbeError(p, "%s", zMiss);
+      sqlite3_free(zMiss);
+    }
+  }
 #endif
   assert( rc );
 #ifdef SQLITE_DEBUG
@@ -132088,6 +132130,9 @@ static void attachFunc(
         /* Both the Btree and the new Schema were allocated successfully.
         ** Close the old db and update the aDb[] slot with the new memdb
         ** values.  */
+#if defined(DOLTLITE_PROLLY) && !defined(SQLITE_OMIT_VIRTUALTABLE)
+        sqlite3VtabEponymousSchemaClear(db, pNew->pSchema);
+#endif
         sqlite3BtreeClose(pNew->pBt);
         pNew->pBt = pNewBt;
         pNew->pSchema = pNewSchema;
@@ -156210,6 +156255,7 @@ static int sqlite3LockAndPrepare(
   if( bTopLevel ){
     char *zOldSourceErr = doltliteTakeChunkSourceError(db, 0);
     sqlite3_free(zOldSourceErr);
+    sqlite3_free(doltliteTakeMissingChunkError(db, SQLITE_OK));
   }
   rc = doltliteBtreeRunDeferredWork(db);
   if( rc!=SQLITE_OK ) goto lock_and_prepare_out;
@@ -156241,6 +156287,12 @@ lock_and_prepare_out:
                          "%s", zSourceErr);
     }else if( sourceRc!=SQLITE_OK && !db->mallocFailed ){
       sqlite3Error(db, sourceRc);
+    }else if( rc!=SQLITE_OK && !db->mallocFailed ){
+      char *zMiss = doltliteTakeMissingChunkError(db, rc);
+      if( zMiss ){
+        sqlite3ErrorWithMsg(db, rc, "%s", zMiss);
+        sqlite3_free(zMiss);
+      }
     }
     sqlite3_free(zSourceErr);
   }
@@ -171472,6 +171524,28 @@ SQLITE_PRIVATE void sqlite3VtabEponymousTableClear(sqlite3 *db, Module *pMod){
     pMod->pEpoTab = 0;
   }
 }
+
+#ifdef DOLTLITE_PROLLY
+/*
+** Deserialize is about to free pSchema. An eponymous table caches that
+** pointer, and the next prepare searches aDb[] for it. Drop those tables
+** first so the next reference builds one on the replacement schema.
+*/
+SQLITE_PRIVATE void sqlite3VtabEponymousSchemaClear(sqlite3 *db, Schema *pSchema){
+  HashElem *p;
+  HashElem *pNext;
+
+  assert( sqlite3_mutex_held(db->mutex) );
+  if( pSchema==0 ) return;
+  for(p=sqliteHashFirst(&db->aModule); p; p=pNext){
+    Module *pMod = (Module*)sqliteHashData(p);
+    pNext = sqliteHashNext(p);
+    if( pMod->pEpoTab && pMod->pEpoTab->pSchema==pSchema ){
+      sqlite3VtabEponymousTableClear(db, pMod);
+    }
+  }
+}
+#endif
 
 /*
 ** Return the ON CONFLICT resolution mode in effect for the virtual
@@ -482824,6 +482898,35 @@ int chunkStoreVerifyChunk(
   return SQLITE_OK;
 }
 
+static int csReadChunk(
+  ChunkStore *cs,
+  const ChunkIndexEntry *e,
+  const ProllyHash *pHash,
+  u8 **ppData,
+  int *pnData
+){
+  u8 *pBuf;
+  int rc;
+  int sz = e->size;
+
+  if( sz > INT_MAX - 4 ) return SQLITE_TOOBIG;
+  pBuf = (u8*)sqlite3_malloc(sz + 4);
+  if( !pBuf ) return SQLITE_NOMEM;
+  rc = csReadSliced(cs, pBuf, (i64)sz + 4, e->offset);
+  if( rc!=SQLITE_OK ){
+    sqlite3_free(pBuf);
+    return rc;
+  }
+  if( CS_READ_U32(pBuf)!=(u32)sz ){
+    sqlite3_free(pBuf);
+    return SQLITE_CORRUPT;
+  }
+  memmove(pBuf, pBuf + 4, sz);
+  *ppData = pBuf;
+  *pnData = sz;
+  return chunkStoreVerifyChunk(pHash, ppData, pnData, cs->pStats);
+}
+
 int chunkStoreGet(
   ChunkStore *cs,
   const ProllyHash *hash,
@@ -482898,35 +483001,139 @@ int chunkStoreGet(
       return SQLITE_CORRUPT;
     }
 
-    {
-      i64 fileOff = e->offset;
-      int sz = e->size;
-      u8 *pBuf;
-      u32 storedLen;
+    return csReadChunk(cs, e, hash, ppData, pnData);
+  }
+}
 
-      if( sz > INT_MAX - 4 ) return SQLITE_TOOBIG;
-      pBuf = (u8 *)sqlite3_malloc(sz + 4);
-      if( pBuf == 0 ) return SQLITE_NOMEM;
+typedef struct CsBatchRead CsBatchRead;
+struct CsBatchRead {
+  ChunkIndexEntry entry;
+  int iOut;
+};
 
-      rc = csReadSliced(cs, pBuf, (i64)sz + 4, fileOff);
-      if( rc != SQLITE_OK ){
-        sqlite3_free(pBuf);
-        return rc;
+static int csBatchReadCmp(const void *a, const void *b){
+  const CsBatchRead *p = (const CsBatchRead*)a;
+  const CsBatchRead *q = (const CsBatchRead*)b;
+  if( p->entry.offset<q->entry.offset ) return -1;
+  if( p->entry.offset>q->entry.offset ) return 1;
+  return p->iOut - q->iOut;
+}
+
+static int csReadBatchFits(i64 iStart, i64 iEnd, const ChunkIndexEntry *e){
+  return e->offset>=iEnd && e->offset-iEnd<=CS_WAL_CHUNK_HDR_SIZE
+      && e->offset-iStart<=CHUNK_READ_BATCH_BYTES-e->size-4;
+}
+
+int chunkStoreReadBatch(
+  ChunkStore *cs,
+  const ProllyHash *aHash,
+  int nHash,
+  u8 **apData,
+  int *anData,
+  int *pnRead
+){
+  CsBatchRead aRead[CHUNK_READ_BATCH_MAX];
+  u8 *pBuf = 0;
+  int nRead = 0;
+  int nMax = MIN(nHash, CHUNK_READ_BATCH_MAX);
+  int rc = SQLITE_OK;
+  int i;
+
+  *pnRead = 0;
+  if( nHash<0 || nHash>CHUNK_READ_BATCH_MAX ) return SQLITE_MISUSE;
+  if( nHash==0 ) return SQLITE_OK;
+  memset(apData, 0, nMax*sizeof(*apData));
+  memset(anData, 0, nMax*sizeof(*anData));
+  if( cs->notADatabase ) return SQLITE_NOTADB;
+  if( cs->iFailedRootOff ){
+    rc = csScrubFailedRoot(cs);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+  if( cs->corruptMidStream ) return SQLITE_CORRUPT;
+  for(i=0; cs->file.pFile && i<nMax; i++){
+    ChunkIndexEntry e;
+    int idx;
+    int found = 0;
+    rc = csSearchPending(cs, &aHash[i], &idx);
+    if( rc!=SQLITE_OK ) return rc;
+    if( idx>=0 ) break;
+    rc = csSearchRecent(cs, &aHash[i], &idx);
+    if( rc!=SQLITE_OK ) return rc;
+    if( idx>=0 ){
+      e = cs->staging.aRecent[idx];
+    }else{
+      rc = csIndexLookup(cs, &aHash[i], &e, &found);
+      if( rc!=SQLITE_OK ) return rc;
+      if( !found ) break;
+    }
+    if( e.size<0 || e.size>CHUNK_READ_BATCH_BYTES-4
+     || e.offset<CHUNK_MANIFEST_SIZE
+     || e.offset>cs->file.iFileSize-e.size-4 ) break;
+    aRead[nRead].entry = e;
+    aRead[nRead++].iOut = i;
+  }
+  if( nRead==0 ){
+    rc = chunkStoreGet(cs, aHash, apData, anData);
+    if( rc==SQLITE_NOTFOUND ) rc = SQLITE_OK;
+    if( rc==SQLITE_OK ) *pnRead = 1;
+    return rc;
+  }
+  qsort(aRead, nRead, sizeof(*aRead), csBatchReadCmp);
+  for(i=0; i<nRead && rc==SQLITE_OK; ){
+    i64 iStart = aRead[i].entry.offset;
+    i64 iEnd = iStart+aRead[i].entry.size+4;
+    int j = i+1;
+    int k;
+    while( j<nRead && csReadBatchFits(iStart, iEnd, &aRead[j].entry) ){
+      iEnd = aRead[j].entry.offset+aRead[j].entry.size+4;
+      j++;
+    }
+    if( j==i+1 ){
+      int out = aRead[i].iOut;
+      rc = csReadChunk(cs, &aRead[i].entry, &aHash[out],
+                       &apData[out], &anData[out]);
+      i = j;
+      continue;
+    }
+    if( !pBuf ){
+      pBuf = sqlite3_malloc(CHUNK_READ_BATCH_BYTES);
+      if( !pBuf ){
+        rc = SQLITE_NOMEM;
+        break;
       }
-
-      storedLen = CS_READ_U32(pBuf);
-      if( (int)storedLen != sz ){
-        sqlite3_free(pBuf);
-        return SQLITE_CORRUPT;
+    }
+    rc = csReadSliced(cs, pBuf, iEnd-iStart, iStart);
+    for(k=i; k<j && rc==SQLITE_OK; k++){
+      ChunkIndexEntry *e = &aRead[k].entry;
+      const u8 *p = pBuf+(e->offset-iStart);
+      int out = aRead[k].iOut;
+      if( CS_READ_U32(p)!=(u32)e->size ){
+        rc = SQLITE_CORRUPT;
+        break;
       }
-
-      memmove(pBuf, pBuf + 4, sz);
-      *ppData = pBuf;
-      *pnData = sz;
+      apData[out] = sqlite3_malloc(e->size+4);
+      if( !apData[out] ){
+        rc = SQLITE_NOMEM;
+        break;
+      }
+      memcpy(apData[out], p+4, e->size);
+      anData[out] = e->size;
+      rc = chunkStoreVerifyChunk(&aHash[out], &apData[out], &anData[out],
+                                 cs->pStats);
+    }
+    i = j;
+  }
+  sqlite3_free(pBuf);
+  if( rc==SQLITE_OK ){
+    *pnRead = nRead;
+  }else{
+    for(i=0; i<nMax; i++){
+      sqlite3_free(apData[i]);
+      apData[i] = 0;
+      anData[i] = 0;
     }
   }
-
-  return chunkStoreVerifyChunk(hash, ppData, pnData, cs->pStats);
+  return rc;
 }
 
 int chunkStoreBorrow(
@@ -482992,12 +483199,12 @@ int chunkStoreReadAhead(
     int found = 0;
     rc = csIndexLookup(cs, &aHash[i], &e, &found);
     if( rc!=SQLITE_OK ) return rc;
-    if( !found || e.size<=0 || e.size>CHUNK_READ_AHEAD_BYTES-4
+    if( !found || e.size<=0 || e.size>CHUNK_READ_BATCH_BYTES-4
      || e.offset<CHUNK_MANIFEST_SIZE
      || e.offset>cs->file.iFileSize-e.size-4 ) break;
-    if( nEntry && (e.offset<iEnd || e.offset-iEnd>CS_WAL_CHUNK_HDR_SIZE) ) break;
+    if( nEntry && !csReadBatchFits(iStart, iEnd, &e) ) break;
     if( nEntry==0 ) iStart = e.offset;
-    if( e.offset-iStart>CHUNK_READ_AHEAD_BYTES-e.size-4 ) break;
+    if( e.offset-iStart>CHUNK_READ_BATCH_BYTES-e.size-4 ) break;
     iEnd = e.offset+e.size+4;
     aEntry[nEntry++] = e;
   }
@@ -483394,11 +483601,12 @@ void chunkStoreClearStoredHits(ChunkStore *cs){
   cs->storedHitLost = 0;
 }
 
-int chunkStorePut(
+static int csPutChunk(
   ChunkStore *cs,
   const u8 *pData,
   int nData,
-  ProllyHash *pHash
+  ProllyHash *pHash,
+  const ProllyHash *pExpected
 ){
   int rc;
   ProllyHash h;
@@ -483407,6 +483615,7 @@ int chunkStorePut(
   if( nData<0 ) return SQLITE_TOOBIG;
   prollyHashCompute(pData, nData, &h);
   prollyStatAdd(cs->pStats, nHashBytes, (u64)nData);
+  if( pExpected && prollyHashCompare(&h, pExpected)!=0 ) return SQLITE_CORRUPT;
   if( pHash ) memcpy(pHash, &h, sizeof(ProllyHash));
 
   {
@@ -483462,6 +483671,25 @@ int chunkStorePut(
 
   prollyStatAdd(cs->pStats, nChunkWrite, 1);
   return SQLITE_OK;
+}
+
+int chunkStorePut(
+  ChunkStore *cs,
+  const u8 *pData,
+  int nData,
+  ProllyHash *pHash
+){
+  return csPutChunk(cs, pData, nData, pHash, 0);
+}
+
+int chunkStorePutChecked(
+  ChunkStore *cs,
+  const ProllyHash *pExpected,
+  const u8 *pData,
+  int nData
+){
+  if( !pExpected ) return SQLITE_MISUSE;
+  return csPutChunk(cs, pData, nData, 0, pExpected);
 }
 
 int chunkStorePutSparse(
@@ -491055,7 +491283,7 @@ static void readAheadLeaves(ProllyCursor *cur){
   ProllyHash aHash[CHUNK_READ_AHEAD_MAX];
   int i;
 
-  if( nHash<2 || cur->pCache->nMaxByte<2*CHUNK_READ_AHEAD_BYTES ) return;
+  if( nHash<2 || cur->pCache->nMaxByte<2*CHUNK_READ_BATCH_BYTES ) return;
   for(i=0; i<nHash; i++) prollyNodeChildHash(pParent, first+i, &aHash[i]);
   prollyStatAdd(cur->pCache->pStats, nReadAhead, nHash);
   sqlite3BeginBenignMalloc();
@@ -497825,8 +498053,11 @@ int doltliteLoadLiveSchemaSql(sqlite3 *db, const char *zType,
                               const char *zDb,
                               const char *zName, const char *zTblName,
                               char **pzSql);
+#define OPEN_REVISION_MISSING_NONE  0
+#define OPEN_REVISION_MISSING_HASH  1   /* bare commit hash absent locally */
+#define OPEN_REVISION_MISSING_CHUNK 2   /* a ref reaches an absent commit */
 int doltliteResolveOpenRevision(
-  ChunkStore*, const char*, ProllyHash*, ProllyHash*, char**
+  ChunkStore*, const char*, ProllyHash*, ProllyHash*, char**, int*
 );
 int doltliteResolveTableName(sqlite3 *db, const char *zTable, Pgno *piTable);
 char *doltliteResolveTableNumber(sqlite3 *db, Pgno iTable);
@@ -499006,6 +499237,33 @@ static int btreeApplyChunkSourceError(
 }
 
 
+/* A revision reached a chunk the store lacks. CANTOPEN is the one open
+** failure whose message sqlite3_open keeps. */
+static int btreeOpenRevisionMissingError(
+  sqlite3 *db,
+  ChunkStore *cs,
+  const char *zRev,
+  int eMissing
+){
+  char *zDetail;
+  zDetail = chunkStoreSourceTakeError(cs, 0);
+  if( !zDetail ) zDetail = chunkStoreTakeMissingChunkError(cs);
+  cs->bMissingChunk = 0;
+  if( eMissing==OPEN_REVISION_MISSING_HASH && zDetail
+   && !chunkStoreSourceEnabled(cs) ){
+    sqlite3ErrorWithMsg(db, SQLITE_CANTOPEN,
+                        "branch or revision \"%s\" not found: %s",
+                        zRev, zDetail);
+  }else if( eMissing==OPEN_REVISION_MISSING_CHUNK && zDetail ){
+    sqlite3ErrorWithMsg(db, SQLITE_CANTOPEN, "%s", zDetail);
+  }else{
+    sqlite3ErrorWithMsg(db, SQLITE_CANTOPEN,
+                        "branch or revision \"%s\" not found", zRev);
+  }
+  sqlite3_free(zDetail);
+  return SQLITE_CANTOPEN;
+}
+
 /* Pending edits drain into the tree once they hold this much memory, not
 ** after a fixed number of rows: every drain builds and hashes the edited
 ** chunks, which a rolled-back statement throws away and a later drain or
@@ -499768,6 +500026,7 @@ static int prollyBtreeOpenImpl(
     ProllyHash branchCommit;
     ProllyHash revisionCatalog;
     u8 bDeferredOpen = 0;
+    int eMissing = OPEN_REVISION_MISSING_NONE;
     const char *zDef = zBranchFromPath ? zBranchFromPath :
       chunkStoreGetDefaultBranch(&pBt->store);
     if( !zDef ) zDef = "main";
@@ -499775,7 +500034,8 @@ static int prollyBtreeOpenImpl(
     memset(&revisionCatalog, 0, sizeof(revisionCatalog));
     if( zBranchFromPath && !pBt->store.openPending ){
       rc = doltliteResolveOpenRevision(&pBt->store, zDef, &branchCommit,
-                                       &revisionCatalog, &zResolvedBranch);
+                                       &revisionCatalog, &zResolvedBranch,
+                                       &eMissing);
 #if DOLTLITE_ENABLE_CHUNK_SOURCE
       if( rc==SQLITE_NOTFOUND && zResolvedBranch
        && !chunkStoreOriginSourceEnabled(&pBt->store) ){
@@ -499786,8 +500046,14 @@ static int prollyBtreeOpenImpl(
     }
     if( zBranchFromPath && rc!=SQLITE_OK ){
       int openRc;
-      rc = btreeApplyChunkSourceError(db, &pBt->store, rc);
-      if( rc==SQLITE_NOTFOUND ){
+      if( rc==SQLITE_NOTFOUND && eMissing!=OPEN_REVISION_MISSING_NONE ){
+        rc = btreeOpenRevisionMissingError(db, &pBt->store, zDef, eMissing);
+      }else{
+        rc = btreeApplyChunkSourceError(db, &pBt->store, rc);
+      }
+      if( rc==SQLITE_CANTOPEN ){
+        openRc = rc;
+      }else if( rc==SQLITE_NOTFOUND ){
         openRc = SQLITE_CANTOPEN;
         sqlite3ErrorWithMsg(db, openRc,
                             "branch or revision \"%s\" not found", zDef);
@@ -499868,8 +500134,13 @@ static int prollyBtreeOpenImpl(
           rc = SQLITE_OK;
         }
 #endif
-        if( rc!=SQLITE_OK ){
+        if( rc==SQLITE_NOTFOUND && p->isDetached ){
+          rc = btreeOpenRevisionMissingError(db, &pBt->store, zDef,
+                                             OPEN_REVISION_MISSING_CHUNK);
+        }else if( rc!=SQLITE_OK ){
           rc = btreeApplyChunkSourceError(db, &pBt->store, rc);
+        }
+        if( rc!=SQLITE_OK ){
           btreeClearBranchState(&state);
           pagerShimDestroy(pBt->pPagerShim);
           prollyCacheFree(&pBt->cache);
@@ -501630,6 +501901,10 @@ int doltliteBtreeRunDeferredWork(sqlite3 *db){
   if( rc!=SQLITE_OK ){
     char *zErr = doltliteTakeChunkSourceError(db, 0);
     if( zErr ){
+      sqlite3ErrorWithMsg(db, rc, "%s", zErr);
+      sqlite3_free(zErr);
+      sqlite3_free(doltliteTakeMissingChunkError(db, SQLITE_OK));
+    }else if( (zErr = doltliteTakeMissingChunkError(db, rc))!=0 ){
       sqlite3ErrorWithMsg(db, rc, "%s", zErr);
       sqlite3_free(zErr);
     }else{
@@ -511545,7 +511820,7 @@ int doltliteBtreeHydrateDeferred(Btree *p){
     ProllyHash commit;
     memset(&commit, 0, sizeof(commit));
     rc = doltliteResolveOpenRevision(cs, p->zBranch, &commit,
-                                     &loadedCatHash, &zPrepared);
+                                     &loadedCatHash, &zPrepared, 0);
     if( rc!=SQLITE_OK ){
       sqlite3_free(zPrepared);
       return rc==SQLITE_NOTFOUND ? SQLITE_CANTOPEN : rc;
@@ -517976,6 +518251,12 @@ static int csHasOrigin(ChunkStore *cs){
       && zUrl && zUrl[0];
 }
 
+static int csNoteMissingChunk(ChunkStore *cs, const ProllyHash *pHash){
+  cs->bMissingChunk = 1;
+  memcpy(&cs->missingChunk, pHash, sizeof(*pHash));
+  return SQLITE_NOTFOUND;
+}
+
 #if DOLTLITE_ENABLE_CHUNK_SOURCE
 
 #define CS_SOURCE_CACHE_BUCKETS 256
@@ -517983,7 +518264,6 @@ static int csHasOrigin(ChunkStore *cs){
 #define CS_SOURCE_CACHE_MAX_BYTES (16*1024*1024)
 #define CS_SOURCE_BUSY_RETRY_COUNT 200
 #define CS_SOURCE_BUSY_RETRY_US 5000
-#define CS_SOURCE_REMOTE_BATCH_SIZE 256
 
 typedef struct DoltliteChunkSourceEntry DoltliteChunkSourceEntry;
 struct DoltliteChunkSourceEntry {
@@ -518074,11 +518354,11 @@ static int SQLITE_CALLBACK csOriginGetMany(
     }
   }
 
-  for(offset=0; offset<nHash; offset += CS_SOURCE_REMOTE_BATCH_SIZE){
-    ProllyHash aBatch[CS_SOURCE_REMOTE_BATCH_SIZE];
+  for(offset=0; offset<nHash; offset += CHUNK_READ_BATCH_MAX){
+    ProllyHash aBatch[CHUNK_READ_BATCH_MAX];
     int nBatch = nHash - offset;
-    if( nBatch>CS_SOURCE_REMOTE_BATCH_SIZE ){
-      nBatch = CS_SOURCE_REMOTE_BATCH_SIZE;
+    if( nBatch>CHUNK_READ_BATCH_MAX ){
+      nBatch = CHUNK_READ_BATCH_MAX;
     }
     for(i=0; i<nBatch; i++){
       memcpy(aBatch[i].data,
@@ -518490,7 +518770,7 @@ int chunkStoreSourceGet(
   int rc;
   if( !p ){
     if( csHasOrigin(cs) ) return csSourceSetModeError(cs, pHash);
-    return SQLITE_NOTFOUND;
+    return csNoteMissingChunk(cs, pHash);
   }
   csSourceClearError(p);
   rc = csSourceCacheGet(p, pHash, ppData, pnData);
@@ -518513,7 +518793,7 @@ int chunkStoreSourceGet(
     if( csHasOrigin(cs) && !p->originEnabled ){
       return csSourceSetModeError(cs, pHash);
     }
-    return SQLITE_NOTFOUND;
+    return csNoteMissingChunk(cs, pHash);
   }
   sourceRc = pSource->xGet(pSource->pCtx, pHash->data, &pData, &nData);
   if( sourceRc==DOLTLITE_SOURCE_NOTFOUND ){
@@ -518886,6 +519166,40 @@ SQLITE_API int SQLITE_APICALL doltlite_set_chunk_source(
   return rc;
 }
 
+/* Remotes are local configuration: the installed refs replace the graph's
+** refs but keep any remote the blob does not name. */
+static int csInstallRefsKeepingRemotes(
+  ChunkStore *cs,
+  const u8 *pRefs,
+  int nRefs
+){
+  char **azKeep = 0;
+  int nKeep = cs->refs.nRemotes;
+  int bAdded = 0;
+  int rc = SQLITE_OK;
+  int i;
+  if( nKeep>0 ){
+    azKeep = (char**)sqlite3_malloc64(sizeof(char*) * 2 * (u64)nKeep);
+    if( !azKeep ) return SQLITE_NOMEM;
+    memset(azKeep, 0, sizeof(char*) * 2 * (size_t)nKeep);
+    for(i=0; rc==SQLITE_OK && i<nKeep; i++){
+      azKeep[i*2] = sqlite3_mprintf("%s", cs->refs.aRemotes[i].zName);
+      azKeep[i*2+1] = sqlite3_mprintf("%s", cs->refs.aRemotes[i].zUrl);
+      if( !azKeep[i*2] || !azKeep[i*2+1] ) rc = SQLITE_NOMEM;
+    }
+  }
+  if( rc==SQLITE_OK ) rc = chunkStoreInstallRefsBlob(cs, pRefs, nRefs);
+  for(i=0; rc==SQLITE_OK && i<nKeep; i++){
+    if( chunkStoreFindRemote(cs, azKeep[i*2], 0)==SQLITE_OK ) continue;
+    rc = chunkStoreAddRemote(cs, azKeep[i*2], azKeep[i*2+1]);
+    bAdded = 1;
+  }
+  if( rc==SQLITE_OK && bAdded ) rc = chunkStoreSerializeRefs(cs);
+  for(i=0; i<nKeep*2 && azKeep; i++) sqlite3_free(azKeep[i]);
+  sqlite3_free(azKeep);
+  return rc;
+}
+
 SQLITE_API int SQLITE_APICALL doltlite_init_lazy(
   sqlite3 *db,
   const void *pRefs,
@@ -518928,7 +519242,7 @@ SQLITE_API int SQLITE_APICALL doltlite_init_lazy(
       rc = chunkStoreForceRefresh(cs);
     }
     if( rc==SQLITE_OK ){
-      rc = chunkStoreInstallRefsBlob(cs, (const u8*)pRefs, nRefs);
+      rc = csInstallRefsKeepingRemotes(cs, (const u8*)pRefs, nRefs);
     }
     if( rc==SQLITE_OK ){
       rc = chunkStoreCommit(cs);
@@ -519019,7 +519333,7 @@ int chunkStoreSourceGet(ChunkStore *cs, const ProllyHash *pHash,
                         u8 **ppData, int *pnData){
   *ppData = 0;
   *pnData = 0;
-  if( !csHasOrigin(cs) ) return SQLITE_NOTFOUND;
+  if( !csHasOrigin(cs) ) return csNoteMissingChunk(cs, pHash);
   if( chunkStoreOriginSourceEnabled(cs) ){
     return csDisabledSetHashError(
         cs, pHash, "DoltLite chunk source support is disabled for",
@@ -519163,6 +519477,31 @@ SQLITE_API int SQLITE_APICALL doltlite_init_lazy(
 }
 
 #endif
+
+char *chunkStoreTakeMissingChunkError(ChunkStore *cs){
+  char zHex[PROLLY_HASH_SIZE*2 + 1];
+  if( !cs->bMissingChunk ) return 0;
+  cs->bMissingChunk = 0;
+  doltliteHashToHex(&cs->missingChunk, zHex);
+  return sqlite3_mprintf(
+      "no chunk source is available for missing chunk %s", zHex);
+}
+
+/* A miss explains only a failure that is otherwise a bare corruption or
+** not-found code; every call forgets the recorded misses. */
+char *doltliteTakeMissingChunkError(sqlite3 *db, int rc){
+  char *zErr = 0;
+  int i;
+  for(i=0; i<db->nDb; i++){
+    ChunkStore *cs = doltliteBtreeChunkStore(db->aDb[i].pBt);
+    if( !cs || !cs->bMissingChunk ) continue;
+    if( !zErr && ((rc & 0xff)==SQLITE_CORRUPT || rc==SQLITE_NOTFOUND) ){
+      zErr = chunkStoreTakeMissingChunkError(cs);
+    }
+    cs->bMissingChunk = 0;
+  }
+  return zErr;
+}
 
 int doltliteChunkSourceActive(sqlite3 *db){
   int i;
@@ -520854,6 +521193,10 @@ int doltliteCheckoutTables(
   sqlite3_value **argv, int iFirstName, int nNames,
   const char **pzMissing, int bSourceHead, int bDropIfAbsent
 );
+int doltliteSuspendForeignKeys(sqlite3 *db, int *pWasOn);
+int doltliteResumeForeignKeys(sqlite3 *db, int wasOn, int rc);
+int doltliteCheckoutRebuildTable(sqlite3 *db, const char *zName,
+                                 int hasCurrent, const char *zSourceSql);
 int doltliteCheckoutDot(
   sqlite3 *db, sqlite3_context *context, const char *zSourceRef,
   const char **pzMissing
@@ -520972,6 +521315,16 @@ int doltliteResolveRefForMutation(
   sqlite3 *db, const char *zRef, ProllyHash *pCommit
 );
 int doltliteUserRefNameIsValid(const char *zName);
+
+/* Workspaces are branch refs under a name no user branch can take: ':' is
+** illegal in user ref names. */
+#define DOLTLITE_WORKSPACE_BRANCH_PREFIX "workspaces:"
+#define DOLTLITE_WORKSPACE_REF_PREFIX "refs/workspaces/"
+int doltliteIsWorkspaceBranch(const char *zBranch);
+int doltliteWorkspaceBranchIsValid(const char *zBranch);
+char *doltliteWorkspaceBranchName(const char *zName);
+int doltliteWorkspaceRefIsValid(const char *zRef);
+char *doltliteWorkspaceBranchFromRef(const char *zRef);
 
 typedef struct DoltliteCommit DoltliteCommit;
 int doltliteLoadCommit(sqlite3 *db, const ProllyHash *pHash,
@@ -523161,7 +523514,9 @@ static int cmdBeginAtomicJoined(Btree *p){
     s->committedCatalogShape = p->committedCatalogShape;
     s->committedVc = p->committedVc;
     memcpy(s->committedAMeta, p->committedAMeta, sizeof(s->committedAMeta));
+    db->nVcInterruptMask++;
     rc = sqlite3_exec(db, "SAVEPOINT doltlite_command", 0, 0, 0);
+    db->nVcInterruptMask--;
   }
   if( rc!=SQLITE_OK ){
     doltliteTxnStateClear(&s->state);
@@ -523287,6 +523642,9 @@ static int cmdEndAtomicJoined(Btree *p, sqlite3_context *ctx){
     }
   }
   sqlite3_finalize(commit);
+  /* A pending interrupt must not fail the command's own savepoint
+  ** bookkeeping, or the savepoint outlives the command. */
+  db->nVcInterruptMask++;
   if( !installed && ((ctx->isError && !p->bCommandKeep) || rc!=SQLITE_OK) ){
     restoreRc = sqlite3_exec(db, "ROLLBACK TO doltlite_command", 0, 0, 0);
     if( restoreRc!=SQLITE_OK ) rc = restoreRc;
@@ -523301,6 +523659,7 @@ static int cmdEndAtomicJoined(Btree *p, sqlite3_context *ctx){
     restoreRc = sqlite3_exec(db, "RELEASE doltlite_command", 0, 0, 0);
     if( restoreRc!=SQLITE_OK ) rc = restoreRc;
   }
+  db->nVcInterruptMask--;
   doltliteNestedTxnDrop(db);
   p->bCommandTxn = 0;
   p->pAtomicCommand = 0;
@@ -529039,7 +529398,8 @@ int mergeRowEditsColumn(
   const ProllyHash *pOtherRoot,
   u8 ancFlags,
   u8 otherFlags,
-  int iField,
+  int iAncField,
+  int iOtherField,
   int bNonNullOnly,
   int *pbEdited
 );
@@ -536300,7 +536660,8 @@ static void doltliteDefaultBranchFunc(
       sqlite3_result_error(ctx, "branch name required", -1);
       return;
     }
-    rc = doltliteMutateRefs(db, mutateDefaultBranch, (void*)zNew);
+    rc = doltliteIsWorkspaceBranch(zNew) ? SQLITE_NOTFOUND
+       : doltliteMutateRefs(db, mutateDefaultBranch, (void*)zNew);
     if( rc==SQLITE_NOTFOUND ){
       char *zErr = sqlite3_mprintf("branch '%s' not found", zNew);
       sqlite3_result_error(ctx, zErr ? zErr : "branch not found", -1);
@@ -536710,6 +537071,7 @@ int doltliteHexToHash(const char *hex, ProllyHash *h){
 /* #include "doltlite_commit.h" */
 /* #include "doltlite_internal.h" */
 /* #include "doltlite_parse.h" */
+/* #include "prolly_btree_int.h" */
 
 static int doltliteRefComponentEndsLock(const char *zStart, const char *zEnd){
   return zEnd-zStart>=5 && memcmp(zEnd-5, ".lock", 5)==0;
@@ -536718,11 +537080,14 @@ static int doltliteRefComponentEndsLock(const char *zStart, const char *zEnd){
 static int doltliteLoadCommitFromStore(
   ChunkStore *cs,
   const ProllyHash *pHash,
-  DoltliteCommit *pCommit
+  DoltliteCommit *pCommit,
+  int *pMissing,
+  int eMissing
 ){
   u8 *data = 0;
   int nData = 0;
   int rc = chunkStoreGet(cs, pHash, &data, &nData);
+  if( rc==SQLITE_NOTFOUND && pMissing ) *pMissing = eMissing;
   if( rc!=SQLITE_OK ) return rc;
   rc = doltliteCommitDeserialize(data, nData, pCommit);
   sqlite3_free(data);
@@ -536733,16 +537098,34 @@ static int doltliteOpenRevisionBase(
   ChunkStore *cs,
   const char *zRef,
   ProllyHash *pCommit,
-  char **pzBranch
+  char **pzBranch,
+  int *pMissing
 ){
   DoltliteCommit commit;
   const char *zBranch = zRef;
+  int eMissing = OPEN_REVISION_MISSING_CHUNK;
   int rc;
 
   *pzBranch = 0;
   if( strcmp(zRef, "HEAD")==0 || strcmp(zRef, "head")==0 ){
     zBranch = chunkStoreGetDefaultBranch(cs);
     if( !zBranch ) return SQLITE_NOTFOUND;
+  }else if( doltliteIsWorkspaceBranch(zRef) ){
+    return SQLITE_NOTFOUND;
+  }else{
+    char *zWorkspace = doltliteWorkspaceBranchFromRef(zRef);
+    if( zWorkspace ){
+      rc = chunkStoreFindBranch(cs, zWorkspace, pCommit);
+      if( rc!=SQLITE_OK || prollyHashIsEmpty(pCommit) ){
+        sqlite3_free(zWorkspace);
+        return rc==SQLITE_OK ? SQLITE_NOTFOUND : rc;
+      }
+      *pzBranch = zWorkspace;
+      memset(&commit, 0, sizeof(commit));
+      rc = doltliteLoadCommitFromStore(cs, pCommit, &commit, pMissing, eMissing);
+      if( rc==SQLITE_OK ) doltliteCommitClear(&commit);
+      return rc;
+    }
   }
   rc = chunkStoreFindBranch(cs, zBranch, pCommit);
   if( rc==SQLITE_OK && !prollyHashIsEmpty(pCommit) ){
@@ -536752,11 +537135,12 @@ static int doltliteOpenRevisionBase(
     rc = chunkStoreFindTag(cs, zRef, pCommit);
     if( rc!=SQLITE_OK && strlen(zRef)==PROLLY_HASH_SIZE*2 ){
       rc = doltliteHexToHash(zRef, pCommit);
+      eMissing = OPEN_REVISION_MISSING_HASH;
     }
   }
   if( rc!=SQLITE_OK || prollyHashIsEmpty(pCommit) ) return SQLITE_NOTFOUND;
   memset(&commit, 0, sizeof(commit));
-  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit);
+  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit, pMissing, eMissing);
   if( rc==SQLITE_OK ) doltliteCommitClear(&commit);
   return rc;
 }
@@ -536764,14 +537148,16 @@ static int doltliteOpenRevisionBase(
 static int doltliteOpenRevisionParent(
   ChunkStore *cs,
   ProllyHash *pCommit,
-  int iParent
+  int iParent,
+  int *pMissing
 ){
   DoltliteCommit commit;
   const ProllyHash *pParent;
   int rc;
 
   memset(&commit, 0, sizeof(commit));
-  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit);
+  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit, pMissing,
+                                   OPEN_REVISION_MISSING_CHUNK);
   if( rc!=SQLITE_OK ) return rc;
   pParent = doltliteCommitParentHash(&commit, iParent);
   if( !pParent ){
@@ -536788,7 +537174,8 @@ int doltliteResolveOpenRevision(
   const char *zRef,
   ProllyHash *pCommit,
   ProllyHash *pCatalog,
-  char **pzBranch
+  char **pzBranch,
+  int *pMissing
 ){
   DoltliteCommit commit;
   char *zBase = 0;
@@ -536798,6 +537185,7 @@ int doltliteResolveOpenRevision(
     return SQLITE_MISUSE;
   }
   *pzBranch = 0;
+  if( pMissing ) *pMissing = OPEN_REVISION_MISSING_NONE;
   nRef = (int)strlen(zRef);
   nBase = nRef;
   for(;;){
@@ -536811,11 +537199,11 @@ int doltliteResolveOpenRevision(
   }
   if( nBase==0 ) return SQLITE_NOTFOUND;
   if( nBase==nRef ){
-    rc = doltliteOpenRevisionBase(cs, zRef, pCommit, pzBranch);
+    rc = doltliteOpenRevisionBase(cs, zRef, pCommit, pzBranch, pMissing);
   }else{
     zBase = sqlite3_mprintf("%.*s", nBase, zRef);
     if( !zBase ) return SQLITE_NOMEM;
-    rc = doltliteOpenRevisionBase(cs, zBase, pCommit, pzBranch);
+    rc = doltliteOpenRevisionBase(cs, zBase, pCommit, pzBranch, pMissing);
     sqlite3_free(*pzBranch);
     *pzBranch = 0;
     sqlite3_free(zBase);
@@ -536838,16 +537226,17 @@ int doltliteResolveOpenRevision(
     }
     if( op=='~' ){
       for(j=0; j<n && rc==SQLITE_OK; j++){
-        rc = doltliteOpenRevisionParent(cs, pCommit, 0);
+        rc = doltliteOpenRevisionParent(cs, pCommit, 0, pMissing);
       }
     }else{
-      rc = doltliteOpenRevisionParent(cs, pCommit, n-1);
+      rc = doltliteOpenRevisionParent(cs, pCommit, n-1, pMissing);
     }
     if( rc!=SQLITE_OK ) return rc;
   }
 
   memset(&commit, 0, sizeof(commit));
-  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit);
+  rc = doltliteLoadCommitFromStore(cs, pCommit, &commit, pMissing,
+                                   OPEN_REVISION_MISSING_CHUNK);
   if( rc==SQLITE_OK ) memcpy(pCatalog, &commit.catalogHash, sizeof(*pCatalog));
   doltliteCommitClear(&commit);
   return rc;
@@ -536899,6 +537288,34 @@ int doltliteUserRefNameIsValid(const char *zName){
     }
   }
   return !doltliteRefComponentEndsLock(zComponent, (const char*)z);
+}
+
+int doltliteIsWorkspaceBranch(const char *zBranch){
+  return zBranch && strncmp(zBranch, DOLTLITE_WORKSPACE_BRANCH_PREFIX,
+                            sizeof(DOLTLITE_WORKSPACE_BRANCH_PREFIX)-1)==0;
+}
+
+char *doltliteWorkspaceBranchName(const char *zName){
+  if( !doltliteUserRefNameIsValid(zName) ) return 0;
+  return sqlite3_mprintf("%s%s", DOLTLITE_WORKSPACE_BRANCH_PREFIX, zName);
+}
+
+int doltliteWorkspaceBranchIsValid(const char *zBranch){
+  return doltliteIsWorkspaceBranch(zBranch)
+      && doltliteUserRefNameIsValid(
+             zBranch + sizeof(DOLTLITE_WORKSPACE_BRANCH_PREFIX)-1);
+}
+
+int doltliteWorkspaceRefIsValid(const char *zRef){
+  int n = (int)sizeof(DOLTLITE_WORKSPACE_REF_PREFIX)-1;
+  return zRef && strncmp(zRef, DOLTLITE_WORKSPACE_REF_PREFIX, n)==0
+      && doltliteUserRefNameIsValid(zRef + n);
+}
+
+char *doltliteWorkspaceBranchFromRef(const char *zRef){
+  int n = (int)sizeof(DOLTLITE_WORKSPACE_REF_PREFIX)-1;
+  if( !zRef || strncmp(zRef, DOLTLITE_WORKSPACE_REF_PREFIX, n)!=0 ) return 0;
+  return doltliteWorkspaceBranchName(zRef + n);
 }
 
 static int doltliteValidateCommitHash(
@@ -536974,14 +537391,23 @@ static int doltliteResolveBaseRef(
 
   for(i=0; i<5; i++){
     switch( i ){
-      case 0:
+      case 0: {
+        char *zWorkspace;
         if( strncmp(zRef, "refs/", 5)!=0 ) continue;
-        rc = doltliteFindRefInNamespace(cs, zRef+5, pCommit);
+        zWorkspace = doltliteWorkspaceBranchFromRef(zRef);
+        if( zWorkspace ){
+          rc = chunkStoreFindBranch(cs, zWorkspace, pCommit);
+          sqlite3_free(zWorkspace);
+        }else{
+          rc = doltliteFindRefInNamespace(cs, zRef+5, pCommit);
+        }
         break;
+      }
       case 1:
         rc = doltliteFindRefInNamespace(cs, zRef, pCommit);
         break;
       case 2:
+        if( doltliteIsWorkspaceBranch(zRef) ) continue;
         rc = chunkStoreFindBranch(cs, zRef, pCommit);
         break;
       case 3:
@@ -544274,6 +544700,7 @@ int mutateBranchRef(sqlite3 *db, ChunkStore *cs, void *pArg);
 
 extern sqlite3_module doltliteBranchesModule;
 extern sqlite3_module doltliteRemoteBranchesModule;
+extern sqlite3_module doltliteWorkspacesModule;
 
 void doltCheckoutFunc(sqlite3_context*, int, sqlite3_value**);
 void doltConnectBranchFunc(sqlite3_context*, int, sqlite3_value**);
@@ -544381,6 +544808,7 @@ int mutateBranchRef(sqlite3 *db, ChunkStore *cs, void *pArg){
   if( p->isDelete ){
     const char *zDefault = chunkStoreGetDefaultBranch(cs);
     (void)db;
+    if( doltliteIsWorkspaceBranch(p->zName) ) return SQLITE_NOTFOUND;
     if( zDefault && strcmp(p->zName, zDefault)==0 ) return SQLITE_CONSTRAINT;
     return chunkStoreDeleteBranch(cs, p->zName);
   }
@@ -544420,6 +544848,7 @@ static int mutateBranchCopy(sqlite3 *db, ChunkStore *cs, void *pArg){
   int rc;
   (void)db;
 
+  if( doltliteIsWorkspaceBranch(p->zSrc) ) return SQLITE_NOTFOUND;
   rc = chunkStoreFindBranch(cs, p->zSrc, &srcCommit);
   if( rc!=SQLITE_OK ) return rc;
   if( !doltliteUserRefNameIsValid(p->zDest) ) return SQLITE_CONSTRAINT;
@@ -544448,6 +544877,7 @@ static int mutateBranchMove(sqlite3 *db, ChunkStore *cs, void *pArg){
   (void)db;
   if( strcmp(p->zSrc, p->zDest)==0 ) return SQLITE_ERROR;
   if( !doltliteUserRefNameIsValid(p->zDest) ) return SQLITE_CONSTRAINT;
+  if( doltliteIsWorkspaceBranch(p->zSrc) ) return SQLITE_NOTFOUND;
   rc = chunkStoreFindBranch(cs, p->zSrc, &srcCommit);
   if( rc!=SQLITE_OK ) return rc;
   if( branchNameTakenIgnoringCase(cs, p->zDest, p->zSrc) ) return SQLITE_ERROR;
@@ -544509,6 +544939,7 @@ static int mutateBranchDelete(sqlite3 *db, ChunkStore *cs, void *pArg){
       p->isDefault = 1;
       return SQLITE_CONSTRAINT;
     }
+    if( doltliteIsWorkspaceBranch(p->azName[i]) ) return SQLITE_NOTFOUND;
     rc = chunkStoreFindBranch(cs, p->azName[i], &branchHead);
     if( rc!=SQLITE_OK ) return rc;
     if( !p->force ){
@@ -544793,6 +545224,112 @@ static void doltBranchFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv)
   doltliteCmdArgsClear(&args);
 }
 
+typedef struct WorkspaceMutationCtx WorkspaceMutationCtx;
+struct WorkspaceMutationCtx {
+  const char *zName;
+  const char *zBranch;
+  const char *zStart;
+  ProllyHash head;
+  int isDelete;
+  int resolveRc;
+  int branchExists;
+};
+
+static int mutateWorkspace(sqlite3 *db, ChunkStore *cs, void *pArg){
+  WorkspaceMutationCtx *p = (WorkspaceMutationCtx*)pArg;
+  if( p->isDelete ){
+    return chunkStoreDeleteBranch(cs, p->zBranch);
+  }
+  if( chunkStoreFindBranch(cs, p->zName, 0)==SQLITE_OK ){
+    p->branchExists = 1;
+    return SQLITE_CONSTRAINT;
+  }
+  if( chunkStoreFindBranch(cs, p->zBranch, 0)==SQLITE_OK ) return SQLITE_ERROR;
+  p->resolveRc = doltliteResolveRefForMutation(db, p->zStart, &p->head);
+  if( p->resolveRc!=SQLITE_OK ) return p->resolveRc;
+  return chunkStoreAddBranch(cs, p->zBranch, &p->head);
+}
+
+static void doltWorkspaceFunc(
+  sqlite3_context *ctx,
+  int argc,
+  sqlite3_value **argv
+){
+  sqlite3 *db = sqlite3_context_db_handle(ctx);
+  ChunkStore *cs = doltliteGetChunkStore(db);
+  DoltliteCmdArgs args;
+  WorkspaceMutationCtx m;
+  int isDelete = 0;
+  int hadExplicitTxn = !db->autoCommit;
+  int hadSavepoint = db->pSavepoint!=0;
+  DoltliteCmdOption aOption[] = {
+    { "delete", 'd', DOLTLITE_CMD_OPTION_FLAG, &isDelete, 0 }
+  };
+  char *zBranch = 0;
+  int rc;
+
+  if( doltliteCmdRejectDetached(ctx) ) return;
+  if( doltliteCmdRejectReadOnly(ctx) ) return;
+  if( !cs ){
+    branchError(ctx, hadSavepoint, doltliteVcUnavailableMessage(db));
+    return;
+  }
+  rc = doltliteCmdParseArgs(ctx, argc, argv, aOption, ArraySize(aOption),
+                            0, &args);
+  if( rc!=SQLITE_OK ){
+    (void)doltliteVcSealSavepointError(db);
+    return;
+  }
+  memset(&m, 0, sizeof(m));
+  m.isDelete = isDelete;
+  if( args.nPositional<1 || branchNameEmpty(args.azPositional[0]) ){
+    branchError(ctx, hadSavepoint, "workspace name required");
+    goto workspace_done;
+  }
+  if( args.nPositional>(isDelete ? 1 : 2) ){
+    branchError(ctx, hadSavepoint, "too many arguments");
+    goto workspace_done;
+  }
+  m.zName = args.azPositional[0];
+  m.zStart = args.nPositional>1 ? args.azPositional[1] : 0;
+  zBranch = doltliteWorkspaceBranchName(m.zName);
+  if( !zBranch ){
+    branchError(ctx, hadSavepoint, "invalid workspace name");
+    goto workspace_done;
+  }
+  m.zBranch = zBranch;
+  if( isDelete && strcmp(zBranch, doltliteGetSessionBranch(db))==0 ){
+    branchError(ctx, hadSavepoint, "cannot delete the current workspace");
+    goto workspace_done;
+  }
+  rc = doltliteMutateRefs(db, mutateWorkspace, &m);
+  if( rc!=SQLITE_OK ){
+    if( m.branchExists ){
+      branchError(ctx, hadSavepoint,
+        "workspace name must not be existing branch name");
+    }else if( m.resolveRc!=SQLITE_OK ){
+      branchNamedResultError(ctx, hadSavepoint, m.resolveRc,
+        "start point not found", "start point not found");
+    }else{
+      branchNamedResultError(ctx, hadSavepoint, rc,
+        "workspace not found", "workspace already exists");
+    }
+    goto workspace_done;
+  }
+  if( hadExplicitTxn ){
+    rc = doltliteVcSealBranchStyleTxn(db);
+    if( rc!=SQLITE_OK ){
+      doltliteVcResultSealError(ctx, db, rc);
+      branchSealSavepointsOnError(ctx, hadSavepoint);
+      goto workspace_done;
+    }
+  }
+  sqlite3_result_int(ctx, 0);
+
+workspace_done:
+  sqlite3_free(zBranch);
+  doltliteCmdArgsClear(&args);
+}
 
 int doltliteBranchRegister(sqlite3 *db){
   int rc;
@@ -544805,6 +545342,9 @@ int doltliteBranchRegister(sqlite3 *db){
                                  doltConnectBranchFunc);
   if(rc==SQLITE_OK) rc = doltliteCreateShieldedModule(db, "dolt_branches", &doltliteBranchesModule, 0);
   if(rc==SQLITE_OK) rc = doltliteCreateShieldedModule(db, "dolt_remote_branches", &doltliteRemoteBranchesModule, 0);
+  if(rc==SQLITE_OK) rc = doltliteCreateCommandFunc(db, "dolt_workspace", -1,
+                                 doltWorkspaceFunc);
+  if(rc==SQLITE_OK) rc = doltliteCreateShieldedModule(db, "dolt_workspaces", &doltliteWorkspacesModule, 0);
   return rc;
 }
 
@@ -544853,7 +545393,15 @@ static void brCurClearSnapshot(BrCur *c){
   c->iRow = 0;
 }
 
-static int brCurSnapshot(BrCur *c, const BranchRef *aBr, int nBr){
+/* bWorkspaces selects the workspace refs, named without their prefix;
+** otherwise only user branches. */
+static int brCurSnapshot(
+  BrCur *c,
+  const BranchRef *aBr,
+  int nBr,
+  int bWorkspaces
+){
+  int nPrefix = bWorkspaces ? (int)sizeof(DOLTLITE_WORKSPACE_BRANCH_PREFIX)-1 : 0;
   int i;
   brCurClearSnapshot(c);
   if( nBr<=0 ) return SQLITE_OK;
@@ -544862,10 +545410,13 @@ static int brCurSnapshot(BrCur *c, const BranchRef *aBr, int nBr){
   if( !c->aSnap ) return SQLITE_NOMEM;
   memset(c->aSnap, 0, (size_t)nBr*sizeof(BranchRef));
   for(i=0; i<nBr; i++){
-    c->nRows = i+1;
-    c->aSnap[i] = aBr[i];
-    c->aSnap[i].zName = sqlite3_mprintf("%s", aBr[i].zName ? aBr[i].zName : "");
-    if( !c->aSnap[i].zName ){
+    const char *zName = aBr[i].zName ? aBr[i].zName : "";
+    BranchRef *pSnap;
+    if( doltliteIsWorkspaceBranch(zName)!=bWorkspaces ) continue;
+    pSnap = &c->aSnap[c->nRows++];
+    *pSnap = aBr[i];
+    pSnap->zName = sqlite3_mprintf("%s", zName + nPrefix);
+    if( !pSnap->zName ){
       brCurClearSnapshot(c);
       return SQLITE_NOMEM;
     }
@@ -544932,7 +545483,7 @@ static int brFilter(sqlite3_vtab_cursor *c, int n, const char *s, int a, sqlite3
     aBr += i;
     nBr = 1;
   }
-  return brCurSnapshot(pCur, aBr, nBr);
+  return brCurSnapshot(pCur, aBr, nBr, 0);
 }
 static int brNext(sqlite3_vtab_cursor *c){
   brClearCommit((BrCur*)c);
@@ -545144,7 +545695,9 @@ static int rbFilter(sqlite3_vtab_cursor *c, int n, const char *s, int a, sqlite3
   if( !pCur->aSnap ) return SQLITE_NOMEM;
   memset(pCur->aSnap, 0, (size_t)nTr*sizeof(BranchRef));
   for(i=0; i<nTr; i++){
-    char *z = sqlite3_mprintf("remotes/%s/%s", aTr[i].zRemote, aTr[i].zBranch);
+    char *z;
+    if( doltliteIsWorkspaceBranch(aTr[i].zBranch) ) continue;
+    z = sqlite3_mprintf("remotes/%s/%s", aTr[i].zRemote, aTr[i].zBranch);
     if( !z ){
       brCurClearSnapshot(pCur);
       return SQLITE_NOMEM;
@@ -545163,6 +545716,37 @@ static int rbFilter(sqlite3_vtab_cursor *c, int n, const char *s, int a, sqlite3
 sqlite3_module doltliteRemoteBranchesModule = {
   0,0,rbConnect,brBestIndex,doltliteVtabDisconnect,0,
   brOpen,brClose,rbFilter,brNext,brEof,brColumn,brRowid,
+  0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+static int wsFilter(sqlite3_vtab_cursor *c, int n, const char *s, int a, sqlite3_value **v){
+  BrVtab *pVtab = (BrVtab*)c->pVtab;
+  BrCur *pCur = (BrCur*)c;
+  ChunkStore *cs = doltliteGetChunkStore(pVtab->db);
+  int nBr = 0;
+  const BranchRef *aBr = 0;
+  (void)s;
+  (void)a;
+  brClearCommit(pCur);
+  brCurClearSnapshot(pCur);
+  if( !cs ) return SQLITE_OK;
+  refsTableGetBranches(&cs->refs, &nBr, &aBr);
+  if( n==1 ){
+    const char *zName = (const char*)sqlite3_value_text(v[0]);
+    char *zBranch = zName ? doltliteWorkspaceBranchName(zName) : 0;
+    int i = zBranch ? csFindNamedRef(cs->refs.aBranches, cs->refs.nBranches,
+                                     (int)sizeof(BranchRef), zBranch) : -1;
+    sqlite3_free(zBranch);
+    if( i<0 ) return SQLITE_OK;
+    aBr += i;
+    nBr = 1;
+  }
+  return brCurSnapshot(pCur, aBr, nBr, 1);
+}
+
+sqlite3_module doltliteWorkspacesModule = {
+  0,0,rbConnect,brBestIndex,doltliteVtabDisconnect,0,
+  brOpen,brClose,wsFilter,brNext,brEof,brColumn,brRowid,
   0,0,0,0,0,0,0,0,0,0,0,0
 };
 
@@ -545749,7 +546333,8 @@ void doltConnectBranchFunc(
     return;
   }
 
-  rc = chunkStoreFindBranch(cs, zBranch, &targetCommit);
+  rc = doltliteIsWorkspaceBranch(zBranch) ? SQLITE_NOTFOUND
+     : chunkStoreFindBranch(cs, zBranch, &targetCommit);
   if( rc!=SQLITE_OK || prollyHashIsEmpty(&targetCommit) ){
     sqlite3_result_error(ctx, "branch not found", -1);
     return;
@@ -545942,11 +546527,14 @@ static int checkoutReconcileTableIndexes(
     if( !aSourceSchema[j].zTblName
      || sqlite3_stricmp(aSourceSchema[j].zTblName, zTable)!=0 ) continue;
     if( !aSourceSchema[j].zName || !aSourceSchema[j].zSql ) continue;
+    /* Another table's index of this name is not the one being restored. */
     rc = sqlite3_prepare_v2(db,
-        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+        "SELECT 1 FROM sqlite_master WHERE type='index'"
+        " AND name=?1 COLLATE NOCASE AND tbl_name=?2 COLLATE NOCASE",
         -1, &pChk, 0);
     if( rc!=SQLITE_OK ) return rc;
     sqlite3_bind_text(pChk, 1, aSourceSchema[j].zName, -1, SQLITE_STATIC);
+    sqlite3_bind_text(pChk, 2, zTable, -1, SQLITE_STATIC);
     exists = sqlite3_step(pChk)==SQLITE_ROW;
     sqlite3_finalize(pChk);
     if( !exists ){
@@ -546229,6 +546817,7 @@ static int checkoutTablesInTxn(
   SchemaEntry *aSourceSchema = 0, *aWorkSchema = 0;
   int nWorking = 0, nSource = 0;
   int nSourceSchema = 0, nWorkSchema = 0;
+  int fkeys = 0;
   int i, j;
   int rc;
 
@@ -546354,10 +546943,10 @@ static int checkoutTablesInTxn(
     return rc;
   }
 
-  for(i=0; i<nNames; i++){
+  rc = doltliteSuspendForeignKeys(db, &fkeys);
+  for(i=0; rc==SQLITE_OK && i<nNames; i++){
     const char *zName = (const char*)sqlite3_value_text(argv[iFirstName + i]);
     int bSchemaChanged;
-    char *zDrop;
     if( !zName ) continue;
     if( aSchema[i].isSchemas ){
       rc = doltliteRevertViewsAndTriggers(db, aSourceSchema, nSourceSchema);
@@ -546370,30 +546959,26 @@ static int checkoutTablesInTxn(
           && strcmp(aSchema[i].zCurrentSql ? aSchema[i].zCurrentSql : "",
                     aSchema[i].zSourceSql ? aSchema[i].zSourceSql : "")!=0);
     if( bSchemaChanged ){
-      if( aSchema[i].hasCurrent ){
-        zDrop = sqlite3_mprintf("DROP TABLE \"%w\"", zName);
-        if( !zDrop ){
-          rc = SQLITE_NOMEM;
-          break;
-        }
-        rc = sqlite3_exec(db, zDrop, 0, 0, 0);
-        sqlite3_free(zDrop);
-        if( rc!=SQLITE_OK ) break;
-      }
-      if( aSchema[i].hasSource ){
-        rc = sqlite3_exec(db, aSchema[i].zSourceSql, 0, 0, 0);
-        if( rc!=SQLITE_OK ) break;
-      }
+      rc = doltliteCheckoutRebuildTable(db, zName, aSchema[i].hasCurrent,
+               aSchema[i].hasSource ? aSchema[i].zSourceSql : 0);
+      if( rc!=SQLITE_OK ) break;
       aSchema[i].rebuilt = 1;
     }
     if( aSchema[i].hasSource ){
       rc = checkoutReconcileTableIndexes(db, aSourceSchema, nSourceSchema, zName);
-      if( rc!=SQLITE_OK ) break;
-      rc = checkoutReconcileVtabShadowIndexes(db, aSourceSchema, nSourceSchema,
-                                              zName);
-      if( rc!=SQLITE_OK ) break;
+      if( rc==SQLITE_OK ){
+        rc = checkoutReconcileVtabShadowIndexes(db, aSourceSchema,
+                                                nSourceSchema, zName);
+      }
+      if( rc!=SQLITE_OK ){
+        if( rc==SQLITE_ERROR ){
+          sqlite3_result_error(context, sqlite3_errmsg(db), -1);
+        }
+        break;
+      }
     }
   }
+  rc = doltliteResumeForeignKeys(db, fkeys, rc);
   if( rc!=SQLITE_OK ){
     freeSchemaEntries(aSourceSchema, nSourceSchema);
     checkoutSchemaInfoClear(aSchema, nNames);
@@ -546728,6 +547313,10 @@ static void doltCheckoutParsedFunc(
 
   if( !createBranch && argc==1 ){
     ProllyHash probe;
+    if( doltliteIsWorkspaceBranch(zBranch) ){
+      checkoutDetachedHeadError(ctx, db);
+      return;
+    }
     if( chunkStoreFindTag(cs, zBranch, &probe)==SQLITE_OK
      && !prollyHashIsEmpty(&probe) ){
       checkoutDetachedHeadError(ctx, db);
@@ -546979,6 +547568,14 @@ void doltCheckoutFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
 #define DOT_PRIMARY 1
 #define DOT_OTHER   2
 
+typedef struct KeptDependents KeptDependents;
+struct KeptDependents {
+  char **azTrigger;
+  int nTrigger;
+  int hasSeq;
+  sqlite3_int64 seq;
+};
+
 typedef struct DotName DotName;
 struct DotName {
   char *z;
@@ -547208,6 +547805,148 @@ int doltliteCheckoutDot(
   sqlite3_free(azPrimary);
   sqlite3_free(azFallback);
   dotFreeNames(aName, nName);
+  return rc;
+}
+
+static void keptClear(KeptDependents *p){
+  int i;
+  for(i=0; i<p->nTrigger; i++) sqlite3_free(p->azTrigger[i]);
+  sqlite3_free(p->azTrigger);
+  memset(p, 0, sizeof(*p));
+}
+
+static int keepTableDependents(
+  sqlite3 *db,
+  const char *zName,
+  KeptDependents *p
+){
+  sqlite3_stmt *pStmt = 0;
+  int rc;
+  memset(p, 0, sizeof(*p));
+  rc = sqlite3_prepare_v2(db,
+      "SELECT sql FROM main.sqlite_schema"
+      " WHERE type='trigger' AND tbl_name=?1 COLLATE NOCASE AND sql IS NOT NULL",
+      -1, &pStmt, 0);
+  if( rc!=SQLITE_OK ) return rc;
+  sqlite3_bind_text(pStmt, 1, zName, -1, SQLITE_STATIC);
+  while( (rc = sqlite3_step(pStmt))==SQLITE_ROW ){
+    char **azNew;
+    char *zSql = sqlite3_mprintf("%s", (const char*)sqlite3_column_text(pStmt, 0));
+    if( !zSql ){ rc = SQLITE_NOMEM; break; }
+    azNew = sqlite3_realloc64(p->azTrigger,
+                              (sqlite3_uint64)(p->nTrigger+1)*sizeof(char*));
+    if( !azNew ){ sqlite3_free(zSql); rc = SQLITE_NOMEM; break; }
+    p->azTrigger = azNew;
+    p->azTrigger[p->nTrigger++] = zSql;
+  }
+  sqlite3_finalize(pStmt);
+  pStmt = 0;
+  if( rc!=SQLITE_DONE ){
+    keptClear(p);
+    return rc;
+  }
+  if( sqlite3FindTable(db, "sqlite_sequence", "main")==0 ) return SQLITE_OK;
+  rc = sqlite3_prepare_v2(db,
+      "SELECT seq FROM main.sqlite_sequence WHERE name=?1", -1, &pStmt, 0);
+  if( rc!=SQLITE_OK ){
+    keptClear(p);
+    return rc;
+  }
+  sqlite3_bind_text(pStmt, 1, zName, -1, SQLITE_STATIC);
+  rc = sqlite3_step(pStmt);
+  if( rc==SQLITE_ROW ){
+    p->hasSeq = 1;
+    p->seq = sqlite3_column_int64(pStmt, 0);
+    rc = SQLITE_DONE;
+  }
+  sqlite3_finalize(pStmt);
+  if( rc!=SQLITE_DONE ){
+    keptClear(p);
+    return rc;
+  }
+  return SQLITE_OK;
+}
+
+static int restoreTableDependents(
+  sqlite3 *db,
+  const char *zName,
+  const KeptDependents *p
+){
+  Table *pTab;
+  int i;
+  int rc = SQLITE_OK;
+  for(i=0; rc==SQLITE_OK && i<p->nTrigger; i++){
+    rc = sqlite3_exec(db, p->azTrigger[i], 0, 0, 0);
+  }
+  if( rc!=SQLITE_OK || !p->hasSeq ) return rc;
+  pTab = sqlite3FindTable(db, zName, "main");
+  if( !pTab || (pTab->tabFlags & TF_Autoincrement)==0 ) return SQLITE_OK;
+  {
+    sqlite3_stmt *pStmt = 0;
+    rc = sqlite3_prepare_v2(db,
+        "INSERT INTO main.sqlite_sequence(name, seq) VALUES(?1, ?2)",
+        -1, &pStmt, 0);
+    if( rc!=SQLITE_OK ) return rc;
+    sqlite3_bind_text(pStmt, 1, zName, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(pStmt, 2, p->seq);
+    rc = sqlite3_step(pStmt);
+    sqlite3_finalize(pStmt);
+    if( rc==SQLITE_DONE ) rc = SQLITE_OK;
+  }
+  return rc;
+}
+
+/* DROP TABLE runs its implicit DELETE through the foreign keys, cascading
+** into tables a checkout does not name. */
+int doltliteSuspendForeignKeys(sqlite3 *db, int *pWasOn){
+  int ignored = 0;
+  int rc = sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_FKEY, -1, pWasOn);
+  if( rc==SQLITE_OK && *pWasOn ){
+    rc = sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_FKEY, 0, &ignored);
+  }
+  return rc;
+}
+
+int doltliteResumeForeignKeys(sqlite3 *db, int wasOn, int rc){
+  int ignored = 0;
+  if( wasOn ){
+    int rc2 = sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_FKEY, 1, &ignored);
+    if( rc==SQLITE_OK ) rc = rc2;
+  }
+  return rc;
+}
+
+/* Replace table zName with zSourceSql (or drop it when zSourceSql is 0),
+** keeping the working triggers and sqlite_sequence row a recreated table
+** would otherwise lose. */
+int doltliteCheckoutRebuildTable(
+  sqlite3 *db,
+  const char *zName,
+  int hasCurrent,
+  const char *zSourceSql
+){
+  KeptDependents kept;
+  int rc = SQLITE_OK;
+  memset(&kept, 0, sizeof(kept));
+  if( hasCurrent ){
+    char *zDrop;
+    if( zSourceSql ){
+      rc = keepTableDependents(db, zName, &kept);
+      if( rc!=SQLITE_OK ) return rc;
+    }
+    zDrop = sqlite3_mprintf("DROP TABLE \"%w\"", zName);
+    if( !zDrop ){
+      keptClear(&kept);
+      return SQLITE_NOMEM;
+    }
+    rc = sqlite3_exec(db, zDrop, 0, 0, 0);
+    sqlite3_free(zDrop);
+  }
+  if( rc==SQLITE_OK && zSourceSql ){
+    rc = sqlite3_exec(db, zSourceSql, 0, 0, 0);
+    if( rc==SQLITE_OK ) rc = restoreTableDependents(db, zName, &kept);
+  }
+  keptClear(&kept);
   return rc;
 }
 
@@ -551971,8 +552710,9 @@ static int mergePass1CheckRowEditOfDroppedColumn(MergePass1Ctx *c){
       struct TableEntry *pEditCatEnt;
       ParsedColumn *aAncCols = 0;
       ParsedColumn *aDropCols = 0;
+      ParsedColumn *aEditCols = 0;
       int *aHeld = 0;
-      int nAncCols = 0, nDropCols = 0;
+      int nAncCols = 0, nDropCols = 0, nEditCols = 0;
 
       if( !zTable || !c->aAncSchema[i].zType ) continue;
       if( strcmp(c->aAncSchema[i].zType, "table")!=0 ) continue;
@@ -551994,24 +552734,11 @@ static int mergePass1CheckRowEditOfDroppedColumn(MergePass1Ctx *c){
       }
       /* The schema merge turns our edits of a column theirs dropped into
       ** row conflicts, but relays their edits onto our layout, which no
-      ** longer has the column. Appending columns leaves every ancestor field
-      ** where it was, so their cells still compare by position. */
+      ** longer has the column. Their own schema change moves fields, so each
+      ** ancestor column is compared against its own field in their layout. */
       if( strcmp(pEditSe->zSql, c->aAncSchema[i].zSql)!=0 ){
-        ParsedColumn *aEditCols = 0;
-        int nEditCols = 0, bAppends;
         if( side
          || parseColumns(pEditSe->zSql, &aEditCols, &nEditCols)!=SQLITE_OK ){
-          freeColumns(aAncCols, nAncCols);
-          freeColumns(aDropCols, nDropCols);
-          continue;
-        }
-        bAppends = nEditCols>nAncCols;
-        for(j=0; bAppends && j<nAncCols; j++){
-          bAppends = sqlite3_stricmp(aEditCols[j].zName, aAncCols[j].zName)==0
-                  && parsedColumnDefinitionsMatch(&aEditCols[j], &aAncCols[j]);
-        }
-        freeColumns(aEditCols, nEditCols);
-        if( !bAppends ){
           freeColumns(aAncCols, nAncCols);
           freeColumns(aDropCols, nDropCols);
           continue;
@@ -552026,6 +552753,7 @@ static int mergePass1CheckRowEditOfDroppedColumn(MergePass1Ctx *c){
         if( !aHeld ){
           freeColumns(aAncCols, nAncCols);
           freeColumns(aDropCols, nDropCols);
+          freeColumns(aEditCols, nEditCols);
           return SQLITE_NOMEM;
         }
         mergeMapColumnsToAncestor(
@@ -552047,13 +552775,14 @@ static int mergePass1CheckRowEditOfDroppedColumn(MergePass1Ctx *c){
           sqlite3_free(aHeld);
           freeColumns(aAncCols, nAncCols);
           freeColumns(aDropCols, nDropCols);
+          freeColumns(aEditCols, nEditCols);
           return rcHold;
         }
         sqlite3_free(zReuse);
       }
       for(j=0; j<nAncCols; j++){
         int bEdited = 0;
-        int iField;
+        int iField, iEditField;
         int rc;
         if( parsedColumnIndexByName(aDropCols, nDropCols,
                                     aAncCols[j].zName)>=0 ){
@@ -552073,13 +552802,26 @@ static int mergePass1CheckRowEditOfDroppedColumn(MergePass1Ctx *c){
         }
         iField = mergeStoredFieldIndex(aAncCols, j);
         if( iField<0 ) continue;
+        iEditField = iField;
+        if( aEditCols ){
+          int k = parsedColumnIndexByName(aEditCols, nEditCols,
+                                          aAncCols[j].zName);
+          /* Gone or redeclared on their side: not the column we dropped. */
+          if( k<0 || !parsedColumnDefinitionsMatch(&aEditCols[k], &aAncCols[j]) ){
+            continue;
+          }
+          iEditField = mergeStoredFieldIndex(aEditCols, k);
+          if( iEditField<0 ) continue;
+        }
         rc = mergeRowEditsColumn(c->db, &pAncCat->root, &pEditCatEnt->root,
                                  pAncCat->flags, pEditCatEnt->flags,
-                                 iField, !c->bBranchMerge && side==1, &bEdited);
+                                 iField, iEditField,
+                                 !c->bBranchMerge && side==1, &bEdited);
         if( rc!=SQLITE_OK ){
           sqlite3_free(aHeld);
           freeColumns(aAncCols, nAncCols);
           freeColumns(aDropCols, nDropCols);
+          freeColumns(aEditCols, nEditCols);
           return rc;
         }
         if( bEdited ){
@@ -552101,12 +552843,14 @@ static int mergePass1CheckRowEditOfDroppedColumn(MergePass1Ctx *c){
           sqlite3_free(aHeld);
           freeColumns(aAncCols, nAncCols);
           freeColumns(aDropCols, nDropCols);
+          freeColumns(aEditCols, nEditCols);
           return SQLITE_ERROR;
         }
       }
       sqlite3_free(aHeld);
       freeColumns(aAncCols, nAncCols);
       freeColumns(aDropCols, nDropCols);
+      freeColumns(aEditCols, nEditCols);
     }
   }
   return SQLITE_OK;
@@ -556184,7 +556928,8 @@ int mergeRowEditsColumn(
   const ProllyHash *pOtherRoot,
   u8 ancFlags,
   u8 otherFlags,
-  int iField,
+  int iAncField,
+  int iOtherField,
   int bNonNullOnly,
   int *pbEdited
 ){
@@ -556195,7 +556940,7 @@ int mergeRowEditsColumn(
   int rc;
 
   *pbEdited = 0;
-  if( !cs || !pCache || iField<0 ) return SQLITE_OK;
+  if( !cs || !pCache || iAncField<0 || iOtherField<0 ) return SQLITE_OK;
   if( prollyHashIsEmpty(pAncRoot) || prollyHashIsEmpty(pOtherRoot) ){
     return SQLITE_OK;
   }
@@ -556218,12 +556963,14 @@ int mergeRowEditsColumn(
       sqlite3_free(aOld);
       continue;
     }
-    if( (!bNonNullOnly || (iField<nNew && aNew[iField].st!=0))
-     && fieldEquals(pChange->pOldVal,
-                    iField<nOld ? &aOld[iField] : (RecField*)&kNullField,
-                    pChange->pNewVal,
-                    iField<nNew ? &aNew[iField] : (RecField*)&kNullField)!=0 ){
-      *pbEdited = 1;
+    if( !bNonNullOnly || (iOtherField<nNew && aNew[iOtherField].st!=0) ){
+      const RecField *fOld = iAncField<nOld ? &aOld[iAncField] : &kNullField;
+      const RecField *fNew = iOtherField<nNew ? &aNew[iOtherField] : &kNullField;
+      /* A DROP COLUMN rewrite re-encodes the untouched cells it keeps. */
+      if( fieldEquals(pChange->pOldVal, fOld, pChange->pNewVal, fNew)!=0
+       && !fieldNumbersEqual(pChange->pOldVal, fOld, pChange->pNewVal, fNew) ){
+        *pbEdited = 1;
+      }
     }
     sqlite3_free(aOld);
     sqlite3_free(aNew);
@@ -581251,6 +581998,7 @@ static int remoteCollectRootsFromRefsBlob(
       }
     }
     for(i=0; i<nBr; i++){
+      if( doltliteIsWorkspaceBranch(aBr[i].zName) ) continue;
       if( !prollyHashIsEmpty(&aBr[i].commitHash) ){
         aRoots[nRoots++] = aBr[i].commitHash;
       }
@@ -581721,12 +582469,30 @@ static int remoteGetChunk(DoltliteRemote *pRemote, const ProllyHash *pHash,
   return chunkStoreGet(((RemoteStoreHdr*)pRemote)->pStore, pHash, ppData, pnData);
 }
 
+static int remoteGetChunks(DoltliteRemote *pRemote, const ProllyHash *aHash,
+                           int nHash, u8 **apData, int *anData){
+  ChunkStore *pStore = ((RemoteStoreHdr*)pRemote)->pStore;
+  int i = 0;
+  int rc = SQLITE_OK;
+  if( nHash<0 ) return SQLITE_MISUSE;
+  if( nHash==0 ) return SQLITE_OK;
+  memset(apData, 0, nHash*sizeof(*apData));
+  memset(anData, 0, nHash*sizeof(*anData));
+  while( i<nHash && rc==SQLITE_OK ){
+    int nRead;
+    rc = chunkStoreReadBatch(pStore, &aHash[i],
+                             MIN(nHash-i, CHUNK_READ_BATCH_MAX),
+                             &apData[i], &anData[i], &nRead);
+    i += nRead;
+  }
+  return rc;
+}
+
 static int remotePutChunk(DoltliteRemote *pRemote, const ProllyHash *pHash,
                           const u8 *pData, int nData){
   ChunkStore *pStore = ((RemoteStoreHdr*)pRemote)->pStore;
-  int rc = syncVerifyFetchedChunk(pHash, pData, nData);
-  if( rc!=SQLITE_OK ) return rc;
-  return chunkStorePut(pStore, pData, nData, 0);
+  if( !pData || nData<0 ) return SQLITE_CORRUPT;
+  return chunkStorePutChecked(pStore, pHash, pData, nData);
 }
 
 static int remoteHasChunks(DoltliteRemote *pRemote, const ProllyHash *aHash,
@@ -581934,6 +582700,7 @@ static DoltliteRemote *fsRemoteOpen(
   memset(p, 0, sizeof(FsRemote));
 
   p->base.xGetChunk = remoteGetChunk;
+  p->base.xGetChunks = remoteGetChunks;
   p->base.xPutChunk = fsPutChunk;
   p->base.xHasChunks = remoteHasChunks;
   p->base.xGetRefs = fsGetRefs;
@@ -582231,6 +582998,7 @@ static DoltliteRemote *doltliteLocalAsRemote(ChunkStore *pLocal,
   }
 
   p->base.xGetChunk = remoteGetChunk;
+  p->base.xGetChunks = remoteGetChunks;
   p->base.xPutChunk = localPutChunk;
   p->base.xHasChunks = remoteHasChunks;
   p->base.xGetRefs = remoteGetRefs;
@@ -582352,9 +583120,20 @@ static int remoteDefaultIsFirstName(const RefsTable *rt, const char *zDefault){
   const BranchRef *a = 0;
   refsTableGetBranches(rt, &n, &a);
   for(i=0; i<n; i++){
+    if( doltliteIsWorkspaceBranch(a[i].zName) ) continue;
     if( strcmp(a[i].zName, zDefault)<0 ) return 0;
   }
   return 1;
+}
+
+static int remoteRefsHaveUserBranch(const RefsTable *rt){
+  int n = 0, i;
+  const BranchRef *a = 0;
+  refsTableGetBranches(rt, &n, &a);
+  for(i=0; i<n; i++){
+    if( !doltliteIsWorkspaceBranch(a[i].zName) ) return 1;
+  }
+  return 0;
 }
 
 /* The default a push leaves on the remote. An empty remote adopts the pushed
@@ -582367,7 +583146,7 @@ static const char *remotePushedDefault(
   int bCreate
 ){
   const char *zDefault = scopedDefaultBranch(pCur);
-  if( !bCreate ) return zDefault;
+  if( !bCreate || doltliteIsWorkspaceBranch(zBranch) ) return zDefault;
   if( refsTableBranchCount(pCur)==0 ) return zBranch;
   if( strcmp(zBranch, "main")==0 ) return zBranch;
   if( strcmp(zBranch, "master")==0 && strcmp(zDefault, "main")!=0
@@ -582704,7 +583483,10 @@ static int remoteValidateScopedRefsUpdate(
     return SQLITE_CONSTRAINT;
   }
   if( !zRef || !zRef[0] ) return SQLITE_MISUSE;
-  if( !doltliteUserRefNameIsValid(zTag ? zTag : zRef) ) return SQLITE_CONSTRAINT;
+  if( !doltliteUserRefNameIsValid(zTag ? zTag : zRef)
+   && (zTag || !doltliteWorkspaceBranchIsValid(zRef)) ){
+    return SQLITE_CONSTRAINT;
+  }
   memset(&inc, 0, sizeof(inc));
   rc = csDeserializeRefsIntoTemp(&inc, pBlob, nBlob);
   if( rc!=SQLITE_OK ){
@@ -583267,6 +584049,13 @@ int doltlitePushAs(
         rc = SQLITE_NOTFOUND;
         goto push_done;
       }
+      /* A refs blob with branches must hold its default branch, and a
+      ** workspace never becomes the default. */
+      if( !bDelete && doltliteIsWorkspaceBranch(zBranch)
+       && !remoteRefsHaveUserBranch(&refs.refs) ){
+        rc = SQLITE_EMPTY;
+        goto push_done;
+      }
       if( !bDelete && exists && !bForce
        && !prollyHashIsEmpty(&remoteCommit)
        && prollyHashCompare(&remoteCommit, &localCommit)!=0 ){
@@ -583500,7 +584289,8 @@ static int installFetchedRefs(
   int commitRefs;
   int descends;
   int ahead;
-  int findRc;
+  int findRc = SQLITE_NOTFOUND;
+  int bWorkspace = doltliteIsWorkspaceBranch(zBranch);
   int i;
   int rc;
 
@@ -583578,9 +584368,15 @@ static int installFetchedRefs(
     }
   }
   if( rc==SQLITE_OK ){
-    findRc = chunkStoreFindTracking(
-        &nextRefs, zRemoteName, zBranch, &currentTracking);
-    if( findRc==SQLITE_NOTFOUND ){
+    findRc = bWorkspace
+        ? chunkStoreFindBranch(&nextRefs, zBranch, &currentTracking)
+        : chunkStoreFindTracking(
+              &nextRefs, zRemoteName, zBranch, &currentTracking);
+    if( findRc==SQLITE_OK && bWorkspace
+     && prollyHashCompare(&currentTracking, pRemoteCommit)==0 ){
+      commitRefs = 1;
+      if( pSettled ) *pSettled = 1;
+    }else if( findRc==SQLITE_NOTFOUND ){
       updateTracking = 1;
       commitRefs = 1;
       if( pSettled ) *pSettled = 1;
@@ -583612,6 +584408,9 @@ static int installFetchedRefs(
           /* The tracking ref moved past this fetch. Do not commit the
           ** older refs snapshot, or its tags and sequences would follow. */
           if( pSettled ) *pSettled = 1;
+        }else if( rc==SQLITE_OK && bWorkspace ){
+          /* A local workspace commit the remote lacks is not overwritten. */
+          rc = SQLITE_CONSTRAINT;
         }else if( rc==SQLITE_OK ){
           /* Diverged. The caller re-reads the remote and tries again. */
           if( pSettled ) *pSettled = 0;
@@ -583619,7 +584418,29 @@ static int installFetchedRefs(
       }
     }
   }
-  if( rc==SQLITE_OK && updateTracking ){
+  if( rc==SQLITE_OK && updateTracking && bWorkspace ){
+    if( findRc==SQLITE_OK ){
+      int iRef = csFindNamedRef(nextRefs.refs.aBranches,
+                                nextRefs.refs.nBranches,
+                                (int)sizeof(BranchRef), zBranch);
+      int dirty = 0;
+      ProllyHash emptyWs;
+      memset(&emptyWs, 0, sizeof(emptyWs));
+      if( iRef>=0 ){
+        rc = scopedWorkingSetIsDirty(
+            pLocal, &nextRefs.refs.aBranches[iRef], &dirty);
+      }
+      if( rc==SQLITE_OK && dirty ) rc = SQLITE_LOCKED;
+      if( rc==SQLITE_OK ){
+        rc = chunkStoreUpdateBranch(&nextRefs, zBranch, pRemoteCommit);
+      }
+      if( rc==SQLITE_OK ){
+        rc = chunkStoreSetBranchWorkingSet(&nextRefs, zBranch, &emptyWs);
+      }
+    }else{
+      rc = chunkStoreAddBranch(&nextRefs, zBranch, pRemoteCommit);
+    }
+  }else if( rc==SQLITE_OK && updateTracking ){
     rc = chunkStoreUpdateTracking(
         &nextRefs, zRemoteName, zBranch, pRemoteCommit);
   }
@@ -583783,6 +584604,7 @@ static int cloneBranchKept(
   int bKeepIsBranch,
   int bSingle
 ){
+  if( doltliteIsWorkspaceBranch(zName) ) return 0;
   if( bSingle ){
     if( bKeepIsBranch ) return strcmp(zName, zKeep)==0;
     return zDefault && strcmp(zName, zDefault)==0;
@@ -583809,11 +584631,12 @@ static int remotePrepareCloneRefs(
   csFreeRemotes(pStore);
   csFreeTracking(pStore);
   rc = chunkStoreAddRemote(pStore, zRemoteName, zUrl);
-  bKeepIsBranch = zKeep && zKeep[0]
+  bKeepIsBranch = zKeep && zKeep[0] && !doltliteIsWorkspaceBranch(zKeep)
                && chunkStoreFindBranch(pStore, zKeep, 0)==SQLITE_OK;
   refsTableGetBranches(&pStore->refs, &nBranch, &aBranch);
   for(i=0; i<nBranch && rc==SQLITE_OK; i++){
     const char *zDefault = chunkStoreGetDefaultBranch(pStore);
+    if( doltliteIsWorkspaceBranch(aBranch[i].zName) ) continue;
     if( !cloneBranchKept(aBranch[i].zName, zDefault, zKeep,
                          bKeepIsBranch, bSingle) && bSingle ){
       continue;
@@ -584711,7 +585534,7 @@ static int remoteSqlSelectLazyRevision(
   memset(&commitHash, 0, sizeof(commitHash));
   memset(&catalogHash, 0, sizeof(catalogHash));
   rc = doltliteResolveOpenRevision(
-      cs, zRevision, &commitHash, &catalogHash, &zBranch);
+      cs, zRevision, &commitHash, &catalogHash, &zBranch, 0);
   if( rc!=SQLITE_OK ){
     sqlite3_free(zBranch);
     return rc;
@@ -584863,6 +585686,7 @@ struct PushTrackingMutation {
 static int mutatePushTracking(sqlite3 *db, ChunkStore *cs, void *pArg){
   PushTrackingMutation *p = (PushTrackingMutation*)pArg;
   (void)db;
+  if( doltliteIsWorkspaceBranch(p->zBranch) ) return SQLITE_OK;
   if( p->bDelete ) return chunkStoreDeleteTracking(cs, p->zRemote, p->zBranch);
   return chunkStoreUpdateTracking(cs, p->zRemote, p->zBranch, &p->commit);
 }
@@ -584905,6 +585729,7 @@ static int doltPushParsedFunc(
   const char *zColon = zRefSpec ? strchr(zRefSpec, ':') : 0;
   char *zSrc = 0;
   char *zDelete = 0;
+  char *zWorkspace = 0;
   ProllyHash srcCommit;
   PushTrackingMutation mutation;
   int bBranch = 0;
@@ -584931,7 +585756,8 @@ static int doltPushParsedFunc(
     if( !zSrc ){ sqlite3_result_error_nomem(ctx); return SQLITE_NOMEM; }
     zRef = remoteSqlStripPrefix(zDst, REMOTE_HEADS_PREFIX);
     /* Destination uses the same rules as dolt_branch. */
-    if( !doltliteUserRefNameIsValid(zRef) ){
+    if( !doltliteUserRefNameIsValid(zRef)
+     && !doltliteWorkspaceRefIsValid(zRef) ){
       sqlite3_free(zSrc);
       doltliteVcResultError(ctx, db, "invalid branch name");
       return SQLITE_ERROR;
@@ -584966,8 +585792,24 @@ static int doltPushParsedFunc(
         return SQLITE_NOTFOUND;
       }
     }
+    if( doltliteWorkspaceRefIsValid(zRef) ){
+      zWorkspace = doltliteWorkspaceBranchFromRef(zRef);
+      if( !zWorkspace ){
+        sqlite3_free(zSrc);
+        sqlite3_result_error_nomem(ctx);
+        return SQLITE_NOMEM;
+      }
+      zRef = zWorkspace;
+    }
   }else if( zRef ){
-    if( zRef[0]==':' ){
+    if( doltliteWorkspaceRefIsValid(zRef + (zRef[0]==':')) ){
+      char *zBranch = doltliteWorkspaceBranchFromRef(zRef + (zRef[0]==':'));
+      zDelete = zBranch ? sqlite3_mprintf("%s%s", zRef[0]==':' ? ":" : "",
+                                          zBranch) : 0;
+      sqlite3_free(zBranch);
+      if( !zDelete ){ sqlite3_result_error_nomem(ctx); return SQLITE_NOMEM; }
+      zRef = zDelete;
+    }else if( zRef[0]==':' ){
       const char *zBranch = remoteSqlStripPrefix(zRef+1, REMOTE_HEADS_PREFIX);
       if( zBranch!=zRef+1 ){
         zDelete = sqlite3_mprintf(":%s", zBranch);
@@ -584986,6 +585828,7 @@ static int doltPushParsedFunc(
   if( remoteSqlReportOpenError(ctx, db, rc, 0) ){
     sqlite3_free(zSrc);
     sqlite3_free(zDelete);
+    sqlite3_free(zWorkspace);
     return rc ? rc : SQLITE_ERROR;
   }
 
@@ -585034,6 +585877,7 @@ static int doltPushParsedFunc(
     pRemote->xClose(pRemote);
     sqlite3_free(zSrc);
     sqlite3_free(zDelete);
+    sqlite3_free(zWorkspace);
     (void)doltliteVcSealSavepointError(db);
     remoteSqlResultError(ctx, rc, 0);
     return rc;
@@ -585047,7 +585891,9 @@ static int doltPushParsedFunc(
     char *zOwned;
     int bRejected = pbRejected && bBranch && !mutation.bDelete
                   && rc==SQLITE_CONSTRAINT;
-    if( bBranch && mutation.bDelete && rc==SQLITE_CONSTRAINT ){
+    if( bBranch && rc==SQLITE_EMPTY ){
+      zMsg = "cannot push a workspace to a remote with no branches";
+    }else if( bBranch && mutation.bDelete && rc==SQLITE_CONSTRAINT ){
       zMsg = "cannot delete the remote default branch";
     }else if( bBranch && mutation.bDelete && rc==SQLITE_MISUSE ){
       zMsg = "push failed: branch name required after ':'";
@@ -585057,7 +585903,15 @@ static int doltPushParsedFunc(
     }else if( !zMsg && rc==SQLITE_NOTFOUND ){
       zMsg = "push failed: branch or tag not found";
     }
-    if( bBranch && mutation.bDelete && rc==SQLITE_NOTFOUND ){
+    if( bBranch && mutation.bDelete && rc==SQLITE_NOTFOUND
+     && doltliteIsWorkspaceBranch(mutation.zBranch) ){
+      zOwned = sqlite3_mprintf(
+          "failed to delete remote; 'refs/workspaces/%s' from remote '%s'; "
+          "workspace not found",
+          mutation.zBranch + strlen(DOLTLITE_WORKSPACE_BRANCH_PREFIX),
+          zRemoteName);
+      if( !zOwned ) rc = SQLITE_NOMEM;
+    }else if( bBranch && mutation.bDelete && rc==SQLITE_NOTFOUND ){
       zOwned = sqlite3_mprintf(
           "failed to delete remote; 'refs/heads/%s' from remote '%s'; "
           "branch not found", mutation.zBranch, zRemoteName);
@@ -585069,6 +585923,7 @@ static int doltPushParsedFunc(
     pRemote->xClose(pRemote);
     sqlite3_free(zSrc);
     sqlite3_free(zDelete);
+    sqlite3_free(zWorkspace);
     if( bRejected ){
       *pbRejected = 1;
       return rc;
@@ -585090,6 +585945,7 @@ static int doltPushParsedFunc(
   }
   sqlite3_free(zSrc);
   sqlite3_free(zDelete);
+  sqlite3_free(zWorkspace);
   if( bLocalLock ) chunkStoreUnlock(cs);
   if( rc!=SQLITE_OK ){
     remoteSqlResultError(ctx, rc, 0);
@@ -585139,7 +585995,9 @@ static int pushEveryLocalBranch(
   }
   for(i=0; i<nBr; i++){
     int bRejected = 0;
-    int pushRc = doltPushParsedFunc(
+    int pushRc;
+    if( doltliteIsWorkspaceBranch(azBranch[i]) ) continue;
+    pushRc = doltPushParsedFunc(
         ctx, zRemoteName, azBranch[i], bForce, 0,
         nBr>1 ? &bRejected : 0);
     if( pushRc==SQLITE_OK ) continue;
@@ -585269,10 +586127,12 @@ static void doltPushFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
   doltliteCmdArgsClear(&args);
 }
 
+/* Workspaces are listed only when bWorkspaces is set. */
 static int parseRemoteBranchNames(
   DoltliteRemote *pRemote,
   char ***pazNames,
-  int *pnNames
+  int *pnNames,
+  int bWorkspaces
 ){
   u8 *refsData = 0;
   int nRefsData = 0;
@@ -585315,6 +586175,7 @@ static int parseRemoteBranchNames(
       }
       memset(azNames, 0, nBr * sizeof(char*));
       for(i=0; i<nBr; i++){
+        if( !bWorkspaces && doltliteIsWorkspaceBranch(aBr[i].zName) ) continue;
         azNames[nNames] = sqlite3_mprintf("%s", aBr[i].zName);
         if( !azNames[nNames] ){
           doltliteFreeStringArray(azNames, nNames);
@@ -585386,6 +586247,11 @@ static int remoteSqlFetchBranch(
                          pbMissingBranch);
   if( rc!=SQLITE_OK && pzErr ){
     const char *zMsg = remoteSqlFetchMsg(pRemote, rc);
+    if( doltliteIsWorkspaceBranch(zTrack) && rc==SQLITE_CONSTRAINT ){
+      zMsg = "fetch failed: local workspace has commits the remote does not";
+    }else if( doltliteIsWorkspaceBranch(zTrack) && rc==SQLITE_LOCKED ){
+      zMsg = "fetch failed: local workspace has uncommitted changes";
+    }
     if( zMsg ){
       *pzErr = sqlite3_mprintf("%s", zMsg);
     }else if( rc==SQLITE_NOTFOUND ){
@@ -585619,7 +586485,7 @@ static void doltFetchFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
     return;
   }
   /* Explicit refspecs are matched against this list before any fetch. */
-  rc = parseRemoteBranchNames(pRemote, &azNames, &nNames);
+  rc = parseRemoteBranchNames(pRemote, &azNames, &nNames, 1);
   if( rc!=SQLITE_OK ){
     const char *zMsg = remoteSqlRemoteMsg(pRemote, rc);
     char *zOwned = zMsg ? sqlite3_mprintf("%s", zMsg) : 0;
@@ -585655,10 +586521,14 @@ static void doltFetchFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
       ** invalid spec cannot leave this one already installed. */
       if( !strchr(zSpec, ':') ){
         const char *zBranch = remoteSqlStripPrefix(zSpec, REMOTE_HEADS_PREFIX);
-        if( !fetchSpecNamePresent(azNames, nNames, zBranch) ){
+        char *zWorkspace = doltliteWorkspaceBranchFromRef(zSpec);
+        if( !fetchSpecNamePresent(azNames, nNames,
+                                  zWorkspace ? zWorkspace : zBranch)
+         || (!zWorkspace && doltliteIsWorkspaceBranch(zBranch)) ){
           rc = fetchSpecResultInvalid(ctx, db,
               "fetch failed: invalid ref spec: '%s'", zBranch);
         }
+        sqlite3_free(zWorkspace);
         continue;
       }
       prc = fetchSpecParseColon(zSpec, &bGlob, &zTrackRemote, &zSrcPat, &zDstPat);
@@ -585672,12 +586542,14 @@ static void doltFetchFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
         for(k=0; k<nNames; k++){
           const char *zCap = 0;
           int nCap = 0;
+          if( doltliteIsWorkspaceBranch(azNames[k]) ) continue;
           if( fetchPatMatch(zSrcPat, azNames[k], &zCap, &nCap) ) bSeen = 1;
         }
         if( !bSeen ){
           rc = fetchSpecResultInvalid(ctx, db, "invalid fetch spec: '%s'", zSpec);
         }
-      }else if( !fetchSpecNamePresent(azNames, nNames, zSrcPat) ){
+      }else if( !fetchSpecNamePresent(azNames, nNames, zSrcPat)
+             || doltliteIsWorkspaceBranch(zSrcPat) ){
         rc = fetchSpecResultInvalid(ctx, db,
             "fetch failed: invalid ref spec: '%s'", zSrcPat);
       }
@@ -585696,7 +586568,9 @@ static void doltFetchFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
       int prc;
       if( !zColon ){
         const char *zBranch;
-        zSrc = sqlite3_mprintf("%s", zSpec);
+        zSrc = doltliteWorkspaceRefIsValid(zSpec)
+             ? doltliteWorkspaceBranchFromRef(zSpec)
+             : sqlite3_mprintf("%s", zSpec);
         if( !zSrc ){
           rc = SQLITE_NOMEM;
           sqlite3_result_error_nomem(ctx);
@@ -585721,6 +586595,7 @@ static void doltFetchFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
           int nCap = 0;
           int missing = 0;
           char *zTrack;
+          if( doltliteIsWorkspaceBranch(azNames[k]) ) continue;
           if( !fetchPatMatch(zSrcPat, azNames[k], &zCap, &nCap) ) continue;
           zTrack = fetchPatApply(zDstPat, zCap, nCap);
           if( !zTrack ){
@@ -585744,6 +586619,7 @@ static void doltFetchFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
   }else{
     for(i=0; i<nNames && rc==SQLITE_OK; i++){
       int missing = 0;
+      if( doltliteIsWorkspaceBranch(azNames[i]) ) continue;
       rc = remoteSqlFetchOne(ctx, db, cs, zUrlOwned, zRemoteName,
                              azNames[i], azNames[i], &missing);
       if( missing ){
@@ -586028,7 +586904,7 @@ static void doltPullParsed(
   ** --prune needs the remote's branch list either way, and unlike fetch
   ** it is allowed together with a branch. */
   if( bFetchAll || bPrune ){
-    rc = parseRemoteBranchNames(pRemote, &azKeep, &nKeep);
+    rc = parseRemoteBranchNames(pRemote, &azKeep, &nKeep, 0);
     if( rc!=SQLITE_OK ){
       const char *zMsg = remoteSqlRemoteMsg(pRemote, rc);
       char *zOwned = zMsg ? sqlite3_mprintf("%s", zMsg) : 0;
@@ -586104,6 +586980,25 @@ static void doltPullParsed(
     if( rc!=SQLITE_OK ){
       doltliteFreeStringArray(azKeep, nKeep);
       remoteSqlRestoreAndReport(ctx, db, cs, &savedState, rc, 0);
+      return;
+    }
+  }
+  /* Fetch-all only visits branches the remote still lists. The branch
+  ** this pull would merge can be gone, and its old tracking ref must
+  ** not be fast-forwarded into the session. */
+  if( rc==SQLITE_OK && bFetchAll ){
+    int i;
+    int foundUpstream = 0;
+    for(i=0; i<nKeep; i++){
+      if( azKeep[i] && strcmp(azKeep[i], zRemoteBranch)==0 ){
+        foundUpstream = 1;
+        break;
+      }
+    }
+    if( !foundUpstream ){
+      doltliteFreeStringArray(azKeep, nKeep);
+      remoteSqlRestoreAndReport(ctx, db, cs, &savedState, SQLITE_NOTFOUND,
+          "fetch failed: branch not found on remote");
       return;
     }
   }
@@ -586334,7 +587229,7 @@ static void doltCloneFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
   if( zBranchOpt ){
     char **azNames = 0;
     int nNames = 0, found = 0, k;
-    rc = parseRemoteBranchNames(pRemote, &azNames, &nNames);
+    rc = parseRemoteBranchNames(pRemote, &azNames, &nNames, 0);
     for(k=0; rc==SQLITE_OK && k<nNames; k++){
       if( strcmp(azNames[k], zBranchOpt)==0 ) found = 1;
     }
