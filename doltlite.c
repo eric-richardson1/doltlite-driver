@@ -520411,6 +520411,37 @@ static SQLITE_INLINE int doltliteVtabColumnNameUsed(
   return 0;
 }
 
+/* The name doltliteAppendDisambiguatedColumnList gives column iName: the
+** prefixed name, suffixed with _1, _2, ... while it collides with another
+** column or a reserved name. NULL on OOM; the caller frees it. */
+static SQLITE_INLINE char *doltliteDisambiguatedColumnName(
+  char *const *azName,
+  int nName,
+  int iName,
+  const char *zPrefix,
+  const char *const *azReserved,
+  int nReserved
+){
+  char *zBase;
+  char *zColumn;
+  int iSuffix = 1;
+  if( !zPrefix ) zPrefix = "";
+  zBase = sqlite3_mprintf("%s%s",zPrefix,azName[iName]);
+  zColumn = zBase;
+  if( !zBase ) return 0;
+  while( doltliteVtabColumnNameUsed(azName,nName,iName,zPrefix,
+                                    azReserved,nReserved,zColumn) ){
+    if( zColumn!=zBase ) sqlite3_free(zColumn);
+    zColumn = sqlite3_mprintf("%s_%d",zBase,iSuffix++);
+    if( !zColumn ){
+      sqlite3_free(zBase);
+      return 0;
+    }
+  }
+  if( zColumn!=zBase ) sqlite3_free(zBase);
+  return zColumn;
+}
+
 static SQLITE_INLINE int doltliteAppendDisambiguatedColumnList(
   sqlite3_str *pStr,
   char *const *azName,
@@ -520423,28 +520454,16 @@ static SQLITE_INLINE int doltliteAppendDisambiguatedColumnList(
   char *const *azDecl
 ){
   int i;
-  if( !zPrefix ) zPrefix = "";
   if( !zSep ) zSep = ", ";
   for(i=0; i<nName; i++){
-    char *zBase = sqlite3_mprintf("%s%s",zPrefix,azName[i]);
-    char *zColumn = zBase;
-    int iSuffix = 1;
-    if( !zBase ) return SQLITE_NOMEM;
-    while( doltliteVtabColumnNameUsed(azName,nName,i,zPrefix,
-                                      azReserved,nReserved,zColumn) ){
-      if( zColumn!=zBase ) sqlite3_free(zColumn);
-      zColumn = sqlite3_mprintf("%s_%d",zBase,iSuffix++);
-      if( !zColumn ){
-        sqlite3_free(zBase);
-        return SQLITE_NOMEM;
-      }
-    }
+    char *zColumn = doltliteDisambiguatedColumnName(azName,nName,i,zPrefix,
+                                                    azReserved,nReserved);
+    if( !zColumn ) return SQLITE_NOMEM;
     if( i>0 ) sqlite3_str_appendall(pStr,zSep);
     sqlite3_str_appendf(pStr,"\"%w\"%s",zColumn,
                         azDecl ? azDecl[i]
                           : i==iIntegerPk ? " INTEGER" : "");
-    if( zColumn!=zBase ) sqlite3_free(zColumn);
-    sqlite3_free(zBase);
+    sqlite3_free(zColumn);
     if( sqlite3_str_errcode(pStr)!=SQLITE_OK ) return sqlite3_str_errcode(pStr);
   }
   return SQLITE_OK;
@@ -564008,10 +564027,38 @@ const sqlite3_module *doltliteHistoryTableModule(void){
 #define AT_IDX_PK_ANY \
   (AT_IDX_PK_EQ|AT_IDX_PK_GE|AT_IDX_PK_LE|AT_IDX_PK_GT|AT_IDX_PK_LT)
 
+/* A table without a rowid is declared WITHOUT ROWID with its primary key,
+** so SQLite identifies its rows by key: a RIGHT or FULL JOIN records which
+** right-hand rows matched by rowid, or by primary key for WITHOUT ROWID, and
+** a scan position is not stable across the PK seeks xFilter does. Tables
+** with a rowid report their integer key from atRowid instead. */
+static int atAppendPrimaryKey(sqlite3_str *pStr, const DoltliteColInfo *ci,
+                              const char *const *azReserved, int nReserved){
+  int k, i;
+  if( ci->bHasRowid || ci->nPk<=0 || !ci->aColToRec ) return SQLITE_OK;
+  for(k=0; k<ci->nPk; k++){
+    for(i=0; i<ci->nCol && ci->aColToRec[i]!=k; i++){}
+    if( i==ci->nCol ) return SQLITE_OK;
+  }
+  sqlite3_str_appendall(pStr, ", PRIMARY KEY(");
+  for(k=0; k<ci->nPk; k++){
+    char *zColumn;
+    for(i=0; ci->aColToRec[i]!=k; i++){}
+    zColumn = doltliteDisambiguatedColumnName(ci->azName,ci->nCol,i,"",
+                                              azReserved,nReserved);
+    if( !zColumn ) return SQLITE_NOMEM;
+    sqlite3_str_appendf(pStr, "%s\"%w\"", k>0 ? ", " : "", zColumn);
+    sqlite3_free(zColumn);
+  }
+  sqlite3_str_appendall(pStr, ")");
+  return sqlite3_str_errcode(pStr);
+}
+
 static char *atBuildSchema(const DoltliteColInfo *ci){
   static const char *const azReserved[] = {"commit_ref"};
   sqlite3_str *pStr = sqlite3_str_new(0);
   char *z;
+  int bWithoutRowid = 0;
   if( !pStr ) return 0;
   sqlite3_str_appendall(pStr, "CREATE TABLE x(");
   if( doltliteAppendDisambiguatedColumnList(
@@ -564020,7 +564067,17 @@ static char *atBuildSchema(const DoltliteColInfo *ci){
     sqlite3_str_reset(pStr);
     return 0;
   }
-  sqlite3_str_appendall(pStr, ", commit_ref TEXT HIDDEN)");
+  sqlite3_str_appendall(pStr, ", commit_ref TEXT HIDDEN");
+  {
+    sqlite3_uint64 nBefore = (sqlite3_uint64)sqlite3_str_length(pStr);
+    if( atAppendPrimaryKey(pStr,ci,azReserved,ArraySize(azReserved))
+          !=SQLITE_OK ){
+      sqlite3_str_reset(pStr);
+      return 0;
+    }
+    bWithoutRowid = (sqlite3_uint64)sqlite3_str_length(pStr)>nBefore;
+  }
+  sqlite3_str_appendall(pStr, bWithoutRowid ? ") WITHOUT ROWID" : ")");
   z = sqlite3_str_finish(pStr);
   return z;
 }
@@ -565007,12 +565064,24 @@ static int atColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx, int col){
   return SQLITE_OK;
 }
 
+/* A rowid table's rows are identified by their integer key, which is stable
+** however the scan reached the row; see atAppendPrimaryKey. */
+static int atRowid(sqlite3_vtab_cursor *cur, sqlite3_int64 *pRowid){
+  AtCursor *c=(AtCursor*)cur;
+  if( c->common.rootIntKey && c->common.tblCurOpen
+   && prollyCursorIsValid(&c->common.tblCur) ){
+    *pRowid = prollyCursorIntKey(&c->common.tblCur);
+    return SQLITE_OK;
+  }
+  return doltliteVtabCommonRowid(cur, pRowid);
+}
+
 static sqlite3_module atModule = {
   0, atConnect, atConnect, atBestIndex,
   doltliteVtabCommonDisconnect, doltliteVtabCommonDisconnect,
   atOpen, atClose,
   atFilter, atNext,
-  doltliteVtabCommonEof, atColumn, doltliteVtabCommonRowid,
+  doltliteVtabCommonEof, atColumn, atRowid,
   0,0,0,0,0,0,0,0,0,0,0,0
 };
 
