@@ -175,7 +175,7 @@
 # define DOLTLITE_PROLLY 1
 #endif
 #ifndef DOLTLITE_VERSION
-# define DOLTLITE_VERSION "dev-efb0901afad158a1e9fd71b2db6fd3ee87f7a453"
+# define DOLTLITE_VERSION "dev-6fb7caede47c7db09f9ba69c3ee2f250120e29c4"
 #endif
 #ifndef DOLTLITE_ENABLE_REMOTES
 # define DOLTLITE_ENABLE_REMOTES 1
